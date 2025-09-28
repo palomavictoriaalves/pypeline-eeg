@@ -1,8 +1,4 @@
-# calc_stats_power.py
-# Minimal paired stats per ROI__Band column.
-# Outputs columns:
-# mean_A, mean_B, delta, normality_test, normality_p,
-# test_used (t_paired or wilcoxon), p_value, sig (asterisks), d (Cohen's dz)
+"""Paired stats for ROI×Band power tables (REL/ABS); outputs per-ROI/band CSVs."""
 
 from pathlib import Path
 import re
@@ -53,8 +49,8 @@ def _wilcoxon_p(a, b):
 
 def choose_test(a, b, p_shapiro, alpha=ALPHA):
     """
-    If p_shapiro >= alpha => differences are approximately normal => use paired t-test.
-    Else => use Wilcoxon signed-rank test.
+    If p_shapiro >= alpha => differences ~ normal => paired t-test.
+    Else => Wilcoxon signed-rank.
     """
     a = np.asarray(a, float); b = np.asarray(b, float)
     if np.isnan(p_shapiro):
@@ -62,7 +58,7 @@ def choose_test(a, b, p_shapiro, alpha=ALPHA):
         return "wilcoxon", pval
     if p_shapiro >= alpha:
         try:
-            t_stat, pval = stats.ttest_rel(a, b, nan_policy="omit")
+            _, pval = stats.ttest_rel(a, b, nan_policy="omit")
             return "t_paired", float(pval)
         except Exception:
             return "t_paired", np.nan
@@ -137,7 +133,7 @@ def paired_summary(df_block, pair_col, level_A, level_B):
     d = A - B
     p_norm = shapiro_p(d)
 
-    # Automatically chosen test
+    # Test choice
     test_used, p_val = choose_test(A, B, p_norm, alpha=ALPHA)
 
     # Effect size (Cohen's dz)
@@ -152,7 +148,7 @@ def paired_summary(df_block, pair_col, level_A, level_B):
         test_used=test_used,
         p_value=p_val,
         sig=p_to_stars(p_val),
-        d=dz
+        d=dz,
     )
 
 # ---------- execution ----------
@@ -182,11 +178,12 @@ def run_for_table(path_csv: Path, tag: str):
     if not out.empty:
         num_cols = [c for c in out.columns if c not in {"group","session","region","band","compare","normality_test","test_used","sig"}]
         out[num_cols] = out[num_cols].apply(pd.to_numeric, errors="coerce").round(15)
+        out = out.sort_values(["group","session","region","band"])
         p_out = out_dir / f"stats_{tag}_EOvsEC.csv"
         out.to_csv(p_out, index=False)
-        print(f"[{tag}] ✅ EC vs EO saved to: {p_out}")
+        print(f"[{tag}] EC vs EO saved to: {p_out}")
     else:
-        print(f"[{tag}] ⚠️ EC vs EO: no results.")
+        print(f"[{tag}] EC vs EO: no results.")
 
     # POST vs PRE (fix visual_state)
     rows = []
@@ -200,13 +197,14 @@ def run_for_table(path_csv: Path, tag: str):
     if not out.empty:
         num_cols = [c for c in out.columns if c not in {"group","visual_state","region","band","compare","normality_test","test_used","sig"}]
         out[num_cols] = out[num_cols].apply(pd.to_numeric, errors="coerce").round(15)
+        out = out.sort_values(["group","visual_state","region","band"])
         p_out = out_dir / f"stats_{tag}_POSTvsPRE.csv"
         out.to_csv(p_out, index=False)
-        print(f"[{tag}] ✅ POST vs PRE saved to: {p_out}")
+        print(f"[{tag}] POST vs PRE saved to: {p_out}")
     else:
-        print(f"[{tag}] ⚠️ POST vs PRE: no results.")
+        print(f"[{tag}] POST vs PRE: no results.")
 
 # Run (REL and ABS)
 run_for_table(REL_PATH, tag="rel")
 run_for_table(ABS_PATH, tag="abs")
-print("\n🎉 Minimal statistics completed for REL and ABS.")
+print("\nMinimal statistics completed for REL and ABS.")

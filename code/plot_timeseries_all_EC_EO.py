@@ -1,7 +1,7 @@
-# code/plot_timeseries_all_EC_EO.py
-# Time-series (EO/EC) per band × ROI, split by PRE/POST and group.
-# Saves a long CSV and 2×3 panels (PRE/POST × groups) with EO and EC means ± 95% CI.
-
+"""
+Time series (EO/EC) per band × ROI, split by PRE/POST and group.
+Saves a long CSV and 2×3 panels (PRE/POST × groups) with EO and EC means ± 95% CI.
+"""
 from pathlib import Path
 import re
 import numpy as np
@@ -13,7 +13,7 @@ from scipy.stats import t, wilcoxon
 
 import config
 
-# ---- I/O and parameters from config ----
+# ---- I/O and parameters from config ------------------------------------------
 PROCESSED_DIR = config.PROCESSED_DIR
 PLOTS_DIR     = config.PLOTS_DIR
 OUT_DIR       = PLOTS_DIR / "timeseries_all"
@@ -28,33 +28,31 @@ PSD_FMAX      = config.PSD_FMAX
 WELCH_SEG_SEC = config.WELCH_SEG_SEC
 WELCH_OVERLAP = config.WELCH_OVERLAP
 
-GROUPS_ORDER   = config.GROUPS_ORDER
-VS_ORDER       = config.VS_ORDER
-ROI_CHANNELS   = config.ROI_CHANNELS
+GROUPS_ORDER  = config.GROUPS_ORDER
+VS_ORDER      = config.VS_ORDER
+ROI_CHANNELS  = config.ROI_CHANNELS
 
-TS_WIN_SEC     = config.TS_WIN_SEC
-TS_STEP_SEC    = config.TS_STEP_SEC
+TS_WIN_SEC    = config.TS_WIN_SEC
+TS_STEP_SEC   = config.TS_STEP_SEC
 
-ALPHA_FDR      = config.TS_FDR_ALPHA
-MARK_SIG       = config.TS_MARK_SIG
+ALPHA_FDR     = config.TS_FDR_ALPHA
+MARK_SIG      = config.TS_MARK_SIG
 GENERATE_PLOTS = config.TS_GENERATE_PLOTS
 
-# ---- Helpers ----
-def parse_sub_sess_state(stem: str):
-    """
-    Extrai subject (NN), session (PRE/POST) e visual state (EO/EC)
-    de nomes no estilo BIDS (ex.: sub-01_ses-post_..._EC_clean_raw.fif)
-    e também dos antigos (ex.: 01_PRE_EO_clean_raw.fif).
-    """
+GROUP_ACTIVE  = set(config.GROUP_ACTIVE)
+GROUP_PASSIVE = set(config.GROUP_PASSIVE)
+GROUP_CONTROL = set(config.GROUP_CONTROL)
+
+# ---- Helpers -----------------------------------------------------------------
+def parse_subject_session_state(stem: str):
+    """Extract subject (NN), session (PRE/POST), and visual state (EO/EC) from filenames."""
     s = stem.upper()
 
-    # subject: sub-01, SUB_01, ou números soltos
     m = re.search(r"SUB[-_]?(\d{2,})", s)
     if not m:
         m = re.search(r"(\d{2,})", s)
     sub = (m.group(1) if m else stem).zfill(2)
 
-    # session: aceita SES-PRE/SES_PRE e também _PRE / -PRE / _POST / -POST / -POS
     if re.search(r"(SES[-_]?PRE|[-_]PRE)(?:[-_]|$)", s):
         sess = "PRE"
     elif re.search(r"(SES[-_]?POST|[-_](POST|POS))(?:[-_]|$)", s):
@@ -62,7 +60,6 @@ def parse_sub_sess_state(stem: str):
     else:
         sess = ""
 
-    # visual state: aceita -EC/_EC/-EO/_EO no meio ou final
     if re.search(r"(^|[-_])EC($|[-_])", s):
         state = "EC"
     elif re.search(r"(^|[-_])EO($|[-_])", s):
@@ -73,31 +70,27 @@ def parse_sub_sess_state(stem: str):
     return sub, sess, state
 
 
-
-def infer_group(sub: str) -> str:
-    """Map subject to study group using config groups."""
+def map_subject_to_group(sub: str) -> str:
+    """Return group label for NN subject code using config groups."""
     sid = str(sub).zfill(2)
-    act = set(getattr(config, "GROUP_ACTIVE", set()))
-    pas = set(getattr(config, "GROUP_PASSIVE", set()))
-    ctl = set(getattr(config, "GROUP_CONTROL", set()))
-    if sid in act: return GROUPS_ORDER[0]
-    if sid in pas: return GROUPS_ORDER[1]
-    if sid in ctl: return GROUPS_ORDER[2]
+    if sid in GROUP_ACTIVE:  return GROUPS_ORDER[0]  # "Active"
+    if sid in GROUP_PASSIVE: return GROUPS_ORDER[1]  # "Passive"
+    if sid in GROUP_CONTROL: return GROUPS_ORDER[2]  # "Control"
     return "Unknown"
 
 
-def discover_rois(chs):
-    """Usa exclusivamente as ROIs definidas no config; exige ≥2 canais por ROI; sempre adiciona 'All'."""
+def rois_from_channels(ch_names):
+    """Use ROIs from config; require ≥2 channels per ROI; always include 'All'."""
     rois = {}
     for name, arr in ROI_CHANNELS.items():
-        got = [c for c in arr if c in chs]
+        got = [c for c in arr if c in ch_names]
         if len(got) >= 2:
             rois[name] = got
-    rois["All"] = list(chs)
+    rois["All"] = list(ch_names)
     return rois
 
 
-def mean_ci95(x):
+def mean_and_ci95(x):
     """Return (mean, lower, upper) 95% CI; NaNs ignored."""
     x = np.asarray(x, float)
     x = x[np.isfinite(x)]
@@ -111,8 +104,8 @@ def mean_ci95(x):
     return m, float(m - tcrit * se), float(m + tcrit * se)
 
 
-def benjamini_hochberg(pvals, alpha=0.05):
-    """Return boolean mask of discoveries using BH-FDR."""
+def fdr_bh_mask(pvals, alpha=0.05):
+    """Benjamini–Hochberg FDR: return boolean mask of discoveries."""
     p = np.asarray(pvals, float)
     n = p.size
     if n == 0:
@@ -128,13 +121,13 @@ def benjamini_hochberg(pvals, alpha=0.05):
     return p <= crit
 
 
-# ---- PSD by sliding epochs ----
+# ---- PSD by sliding epochs ----------------------------------------------------
 def compute_series_for_raw(raw, band_tuple):
-    """Retorna (times_s, abs_by_ch, rel_by_ch, ch_names) por épocas deslizantes."""
+    """Return (times_s, abs_by_ch, rel_by_ch, ch_names) via sliding windows."""
     fmin_band, fmax_band = band_tuple
     raw = raw.copy().pick("eeg")
     sf = float(raw.info["sfreq"])
-    fmax_eff = min(PSD_FMAX, sf/2.0 - 1.0)
+    fmax_eff = min(PSD_FMAX, sf / 2.0 - 1.0)
 
     overlap = TS_WIN_SEC - TS_STEP_SEC
     overlap = max(0.0, min(overlap, TS_WIN_SEC - 1e-3))
@@ -142,13 +135,12 @@ def compute_series_for_raw(raw, band_tuple):
         raw, duration=TS_WIN_SEC, overlap=overlap, preload=True, verbose="ERROR"
     )
     onsets = epochs.events[:, 0] / sf
-    times = onsets + TS_WIN_SEC/2.0
+    times = onsets + TS_WIN_SEC / 2.0
 
+    nseg = int(round(WELCH_SEG_SEC * sf))
     spec = epochs.compute_psd(
         method="welch", fmin=PSD_FMIN, fmax=fmax_eff,
-        n_fft=int(round(WELCH_SEG_SEC*sf)),
-        n_per_seg=int(round(WELCH_SEG_SEC*sf)),
-        n_overlap=int(round(WELCH_OVERLAP*WELCH_SEG_SEC*sf)),
+        n_fft=nseg, n_per_seg=nseg, n_overlap=int(round(WELCH_OVERLAP * nseg)),
         verbose="ERROR"
     )
     psds, freqs = spec.get_data(return_freqs=True)  # (n_ep, n_ch, n_freqs)
@@ -158,26 +150,28 @@ def compute_series_for_raw(raw, band_tuple):
 
     abs_band = psds[:, :, band_mask].mean(axis=2)
     total    = psds[:, :, total_mask].mean(axis=2)
-    rel_band = abs_band / np.where(total > 0, total, np.nan)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        rel_band = abs_band / np.where(total > 0, total, np.nan)
     return times, abs_band, rel_band, epochs.ch_names
 
 
-# ---- Series extraction ----
+# ---- Series extraction --------------------------------------------------------
 def collect_all_series():
-    """Long DataFrame with all series across bands/metrics/ROIs."""
+    """Build a long DataFrame with all series across bands/metrics/ROIs."""
     fifs = sorted(PROCESSED_DIR.rglob("*_clean_raw.fif"))
-    print(f"DEBUG: arquivos encontrados = {len(fifs)}")
+    print(f"Files found: {len(fifs)}")
+
     rows = []
     bank = {}  # (sub, state, sess) -> path
     for f in fifs:
-        sub, sess, state = parse_sub_sess_state(f.stem)
+        sub, sess, state = parse_subject_session_state(f.stem)
         if state in VS_ORDER and sess in {"PRE", "POST"}:
             bank[(sub, state, sess)] = f
-    print(f"DEBUG: pares válidos (sub,state,sess) = {len(bank)}")
+    print(f"Valid (subject, state, session) triplets: {len(bank)}")
 
     for (sub, state, sess), path in bank.items():
-        grp = infer_group(sub)
-        print(f"DEBUG lendo {path.name}")
+        grp = map_subject_to_group(sub)
+        print(f"Reading: {path.name}")
         raw = mne.io.read_raw_fif(path, preload=True, verbose="WARNING")
         try:
             raw.set_montage("standard_1020", on_missing="ignore")
@@ -187,9 +181,9 @@ def collect_all_series():
         for band_name, band_tuple in BANDS.items():
             times, abs_by_ch, rel_by_ch, chs = compute_series_for_raw(raw, band_tuple)
             if times.size == 0 or abs_by_ch.size == 0 or rel_by_ch.size == 0:
-                print("  >> sem dados após pick/PSD; pulando este arquivo/banda")
+                print("  Skipping: no data after pick/PSD")
                 continue
-            rois = discover_rois(chs)
+            rois = rois_from_channels(chs)
             for roi_name, roi_list in rois.items():
                 idx = [chs.index(ch) for ch in roi_list if ch in chs]
                 if len(idx) < 2 and roi_name != "All":
@@ -208,14 +202,14 @@ def collect_all_series():
     return pd.DataFrame.from_records(rows)
 
 
-# ---- Alignment and plotting ----
+# ---- Alignment and plotting ---------------------------------------------------
 def align_pairs_per_subject(df_panel):
     """For a panel, return common time grid and EO/EC matrices aligned per subject."""
-    subs = sorted(df_panel.subject.unique())
+    subs = sorted(df_panel.subject.astype(str).unique(), key=lambda s: int(s))
     ts_common = None
     EO_list, EC_list = [], []
     for sub in subs:
-        dsub = df_panel[df_panel.subject == sub]
+        dsub = df_panel[df_panel.subject.astype(str) == sub]
         d_eo = dsub[dsub.visual_state == "EO"].sort_values("time_s")
         d_ec = dsub[dsub.visual_state == "EC"].sort_values("time_s")
         n = int(min(len(d_eo), len(d_ec)))
@@ -240,8 +234,8 @@ def align_pairs_per_subject(df_panel):
     return ts_common, np.vstack(EO_list), np.vstack(EC_list)
 
 
-def plot_grid_2x3(df_all, band, metric, roi):
-    """2×3 panel (PRE/POST × groups) with EO/EC means ± 95% CI; BH-FDR marking optional."""
+def plot_timeseries_grid(df_all, band, metric, roi):
+    """2×3 panel (PRE/POST × groups) with EO/EC means ± 95% CI; optional BH-FDR marks."""
     fig = plt.figure(figsize=(13.2, 8.0), facecolor="white")
     gs = gridspec.GridSpec(nrows=2, ncols=3, figure=fig, wspace=0.24, hspace=0.34)
     axes = np.empty((2, 3), dtype=object)
@@ -253,11 +247,9 @@ def plot_grid_2x3(df_all, band, metric, roi):
                 ax.spines[spine].set_visible(False)
             axes[i, j] = ax
 
-    # column titles (groups)
     for j, grp in enumerate(GROUPS_ORDER):
         axes[0, j].set_title(grp, fontsize=13, pad=12)
 
-    # PRE/POST labels on the left margin
     bbox0 = axes[0, 0].get_position()
     bbox1 = axes[1, 0].get_position()
     y_pre_center  = (bbox0.y0 + bbox0.y1) / 2
@@ -268,7 +260,6 @@ def plot_grid_2x3(df_all, band, metric, roi):
     sessions = ["PRE", "POST"]
     legend_handles, legend_labels = None, None
 
-    # same y-limits within each row
     row_ymins = [np.inf, np.inf]
     row_ymaxs = [-np.inf, -np.inf]
 
@@ -288,8 +279,8 @@ def plot_grid_2x3(df_all, band, metric, roi):
 
             mean_eo = np.nanmean(EO, axis=0)
             mean_ec = np.nanmean(EC, axis=0)
-            ci_eo = np.array([mean_ci95(EO[:, k]) for k in range(EO.shape[1])])
-            ci_ec = np.array([mean_ci95(EC[:, k]) for k in range(EC.shape[1])])
+            ci_eo = np.array([mean_and_ci95(EO[:, k]) for k in range(EO.shape[1])])
+            ci_ec = np.array([mean_and_ci95(EC[:, k]) for k in range(EC.shape[1])])
 
             h1, = ax.plot(ts, mean_eo, label="EO", linewidth=2.0)
             ax.fill_between(ts, ci_eo[:, 1], ci_eo[:, 2], alpha=0.18)
@@ -301,7 +292,7 @@ def plot_grid_2x3(df_all, band, metric, roi):
 
             ax.set_xlabel("Time (s)", fontsize=11)
             if j == 0:
-                ax.set_ylabel("Rel Power" if metric == "rel" else "Abs Power", fontsize=11)
+                ax.set_ylabel("Relative Power" if metric == "rel" else "Absolute Power", fontsize=11)
 
             if MARK_SIG:
                 pvals = []
@@ -315,7 +306,7 @@ def plot_grid_2x3(df_all, band, metric, roi):
                     except Exception:
                         p = 1.0
                     pvals.append(float(p))
-                sigmask = benjamini_hochberg(np.array(pvals), alpha=ALPHA_FDR)
+                sigmask = fdr_bh_mask(np.array(pvals), alpha=ALPHA_FDR)
 
                 y_top = np.nanmax([ci_eo[:, 2], ci_ec[:, 2]])
                 dy = (np.nanmax([mean_eo, mean_ec]) - np.nanmin([mean_eo, mean_ec]))
@@ -341,7 +332,6 @@ def plot_grid_2x3(df_all, band, metric, roi):
                 ax.set_ylim(ymin - pad, ymax + pad)
 
     fig.suptitle(f"Time Series — {band} — {metric.upper()} — ROI: {roi}", fontsize=16, y=0.97)
-
     plt.subplots_adjust(left=0.12, right=0.86, bottom=0.10, top=0.90)
 
     if legend_handles is not None:
@@ -352,15 +342,15 @@ def plot_grid_2x3(df_all, band, metric, roi):
     fname = FIG_DIR / f"timeseries_{band}_{metric}_{roi.replace(' ','_')}.png"
     fig.savefig(fname, dpi=300, bbox_inches="tight")
     plt.close(fig)
-    print(f"saved: {fname}")
+    print(f"Saved: {fname}")
 
 
-# ---- Main ----
+# ---- Main --------------------------------------------------------------------
 def main():
-    print("DEBUG PROCESSED_DIR =", PROCESSED_DIR.resolve())
-    print("DEBUG count =", len(list(PROCESSED_DIR.rglob("*_clean_raw.fif"))))
+    print("Scanning derivatives…", PROCESSED_DIR.resolve())
+    print("Files matching *_clean_raw.fif:", len(list(PROCESSED_DIR.rglob("*_clean_raw.fif"))))
 
-    print("Extracting time series for all bands/ROIs (relative and absolute)...")
+    print("Extracting time series for all bands/ROIs (relative and absolute)…")
     df = collect_all_series()
     if df.empty:
         print("No data extracted. Check PROCESSED_DIR and filenames.")
@@ -368,16 +358,16 @@ def main():
 
     csv_all = CSV_DIR / "timeseries_all_bands_rois_relabs.csv"
     df.to_csv(csv_all, index=False)
-    print(f"saved CSV: {csv_all}")
+    print(f"Saved CSV: {csv_all}")
 
     if GENERATE_PLOTS:
-        bands = sorted(df.band.unique(), key=lambda x: list(BANDS.keys()).index(x) if x in BANDS else 999)
+        bands = [b for b in BANDS.keys() if b in df.band.unique()]
         metrics = ["rel", "abs"]
         rois = sorted(df.roi.unique())
         for band in bands:
             for metric in metrics:
                 for roi in rois:
-                    plot_grid_2x3(df, band, metric, roi)
+                    plot_timeseries_grid(df, band, metric, roi)
 
     print("Done.")
 

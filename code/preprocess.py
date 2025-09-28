@@ -1,27 +1,4 @@
-"""
-End-to-end EEG preprocessing (BIDS-aware)
-
-Inputs (read-only)
-- BrainVision headers (*.vhdr) under DATA_DIR/**/eeg/ (BIDS structure).
-- Each .vhdr must point to the correct .eeg/.vmrk (fixed by fix_brainvision_links.py).
-
-Outputs (derivatives)
-- results/processed/sub-XX[/ses-YY]/eeg/
-  sub-XX[_ses-YY]_task-<task>[_run-<run>]_desc-preproc_clean_raw.fif
-  sub-XX[_ses-YY]_task-<task>[_run-<run>]_desc-preproc_EO_clean_raw.fif
-  sub-XX[_ses-YY]_task-<task>[_run-<run>]_desc-preproc_EC_clean_raw.fif
-  sub-XX[_ses-YY]_task-<task>[_run-<run>]_desc-preproc_blocks_manifest.csv
-
-Processing pipeline
-1) Import (MNE): read BrainVision, apply “standard_1020” montage.
-2) Filters: band-pass [FILTER_LOW, FILTER_HIGH] Hz + notch at NOTCH_HZ Hz.
-3) Reference: average reference across EEG channels.
-4) Segmentation: fixed EO/EC blocks from config.BLOCKS_WITH_STATE; truncated at file end.
-5) ICA: Infomax (extended), fitted on 1–40 Hz copy; random_state=97.
-6) ICLabel: automatic rejection of non-brain ICs (eye, muscle, heart, line/channel noise).
-7) Annotation: concatenated stream with “visual_state:EO/EC”.
-8) Save: concatenated file, EO/EC splits, and block manifest CSV.
-"""
+"""End-to-end EEG preprocessing (BIDS-aware)."""
 
 from pathlib import Path
 import re
@@ -117,7 +94,7 @@ def _save_blocks_manifest(csv_path, manifest_rows):
         w.writerow(["file", "visual_state", "block_idx", "onset_s", "end_s", "duration_s", "used"])
         for row in manifest_rows:
             w.writerow(row)
-    print(f"  📝 Block manifest saved: {csv_path}")
+    print(f"Block manifest saved: {csv_path}")
 
 # --- BIDS discovery/output helpers -------------------------------------------
 files = sorted(p for p in DATA_DIR.rglob("*.vhdr") if p.parent.name == "eeg")
@@ -128,7 +105,8 @@ BIDS_VHDR_RE = re.compile(
     r"(?:_(?P<ses>ses-[^_/]+))?"
     r"_task-(?P<task>[^_/]+)"
     r"(?:_run-(?P<run>[^_/]+))?"
-    r"_eeg\.vhdr$", re.IGNORECASE
+    r"_eeg\.vhdr$",
+    re.IGNORECASE,
 )
 
 def parse_bids_entities(path: Path):
@@ -136,10 +114,12 @@ def parse_bids_entities(path: Path):
     if not m:
         return {"sub": "sub-UNK", "ses": None, "task": "rest", "run": None}
     d = m.groupdict()
-    return {"sub": d.get("sub") or "sub-UNK",
-            "ses": d.get("ses") or None,
-            "task": d.get("task") or "rest",
-            "run": d.get("run") or None}
+    return {
+        "sub": d.get("sub") or "sub-UNK",
+        "ses": d.get("ses") or None,
+        "task": d.get("task") or "rest",
+        "run": d.get("run") or None,
+    }
 
 def out_paths_for(vhdr_path: Path, desc: str = "preproc"):
     ent = parse_bids_entities(vhdr_path)
@@ -166,20 +146,24 @@ for vhdr_path in files:
     name = vhdr_path.stem
     ent = parse_bids_entities(vhdr_path)
     ent_str = f"[{ent['sub']}{'/' + ent['ses'] if ent['ses'] else ''} | task-{ent['task']}{' | run-' + ent['run'] if ent['run'] else ''}]"
-    print(f"\n🔄 Processing: {name}  {ent_str}")
+    print(f"\nProcessing: {name}  {ent_str}")
 
     try:
+        # Import and montage
         raw = mne.io.read_raw_brainvision(str(vhdr_path), preload=True, verbose="WARNING")
         raw.set_montage("standard_1020")
 
+        # Filters (Hz)
         raw.filter(l_freq=FILTER_LOW, h_freq=FILTER_HIGH, fir_design="firwin")
         try:
             raw.notch_filter(freqs=[NOTCH_HZ])
         except Exception as e:
             print(f"  > WARNING: notch {NOTCH_HZ} Hz not applied: {e}")
 
+        # Reference
         raw.set_eeg_reference(ref_channels="average")
 
+        # Segmentation (seconds)
         blocks, manifest = [], []
         sfreq = float(raw.info.get("sfreq", 250.0))
         tmax = float(raw.times[-1])
@@ -199,11 +183,13 @@ for vhdr_path in files:
 
         raw_concat = mne.concatenate_raws([seg for _, seg in blocks], verbose="WARNING") if blocks else raw.copy()
 
+        # ICA: fit on 1–40 Hz copy, extended Infomax, deterministic seed
         ica = mne.preprocessing.ICA(n_components=0.99, method="infomax",
                                     fit_params=dict(extended=True), random_state=97)
         raw_ica = raw_concat.copy().filter(l_freq=1.0, h_freq=40.0, fir_design="firwin")
         ica.fit(raw_ica)
 
+        # ICLabel-based exclusion
         exclude_idx = []
         sf_full = float(raw.info.get("sfreq", 250.0))
         h_ic = float(min(100.0, max(30.0, sf_full / 2.0 - 1.0)))
@@ -223,6 +209,7 @@ for vhdr_path in files:
         if exclude_idx:
             ica.apply(raw_concat)
 
+        # Annotate concatenated stream with visual_state labels
         annotations, cursor = [], 0.0
         for _, state, _, _, _, dur, used in manifest:
             if used and dur > 0:
@@ -235,8 +222,9 @@ for vhdr_path in files:
                 description=[desc for *_, desc in annotations],
             ))
 
+        # Save concatenated + per-state derivatives
         raw_concat.save(str(opaths["concat"]), overwrite=True)
-        print(f"  ✅ Saved concatenated: {opaths['concat']}")
+        print(f"  Saved concatenated: {opaths['concat']}")
 
         def _extract_state(raw_in, state):
             if not raw_in.annotations:
@@ -261,19 +249,19 @@ for vhdr_path in files:
 
         if raw_EO is not None:
             raw_EO.save(str(opaths["eo"]), overwrite=True)
-            print(f"  ✅ Saved EO: {opaths['eo']}")
+            print(f"  Saved EO: {opaths['eo']}")
         else:
             print("  > NOTE: no EO segment to save.")
 
         if raw_EC is not None:
             raw_EC.save(str(opaths["ec"]), overwrite=True)
-            print(f"  ✅ Saved EC: {opaths['ec']}")
+            print(f"  Saved EC: {opaths['ec']}")
         else:
             print("  > NOTE: no EC segment to save.")
 
         _save_blocks_manifest(opaths["manifest"], manifest)
 
     except Exception as e:
-        print(f"  ❌ ERROR processing {name}: {e}")
+        print(f"  ERROR processing {name}: {e}")
 
-print("\n🎉 Preprocessing finished!")
+print("\nPreprocessing finished.")

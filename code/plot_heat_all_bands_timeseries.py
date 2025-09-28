@@ -1,4 +1,3 @@
-# code/plot_heat_prepost_timeseries.py
 """Heatmaps of band×ROI power over time by participant.
 Rows: EO-PRE, EO-POST, EC-PRE, EC-POST; Columns: Active, Passive, Control.
 Input : results/timeseries/ts_power_long.csv
@@ -12,7 +11,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
 from matplotlib.cm import ScalarMappable
-
+from scipy.integrate import trapezoid
 import config
 
 # Paths / orders
@@ -33,8 +32,8 @@ ROW_ORDER = [
     (STATES[1], SESSIONS[1]),  # EC-POST
 ]
 
-# Helpers
-def robust_limits(x, p_lo=5, p_hi=95):
+# --------------------------- helpers ------------------------------------------
+def compute_value_range(x, p_lo=5, p_hi=95):
     x = np.asarray(x, float)
     x = x[np.isfinite(x)]
     if x.size == 0:
@@ -48,14 +47,14 @@ def robust_limits(x, p_lo=5, p_hi=95):
         return (float(vmax - span), float(vmax + span))
     return (vmin, vmax)
 
-def format_ids(sids, mode="z2"):
+def format_subject_ids(sids, mode="z2"):
     if mode == "S":
         return [f"S{str(s).zfill(2)}" for s in sids]
     if mode == "z2":
         return [str(s).zfill(2) for s in sids]
     return [str(s) for s in sids]
 
-def subject_order_for_pair(df_pair, sort_mode, value_col):
+def order_subjects_for_pair(df_pair, sort_mode, value_col):
     sids = sorted(df_pair["subject"].astype(str).unique(), key=lambda s: int(s))
     if sort_mode == "none":
         return sids
@@ -73,7 +72,7 @@ def subject_order_for_pair(df_pair, sort_mode, value_col):
     sids.sort(key=lambda s: (metrics.get(s, np.nan), int(s)))
     return sids
 
-def detect_block_cuts(tt):
+def detect_time_block_boundaries(tt):
     tt = np.asarray(tt, float)
     if tt.size < 3:
         return []
@@ -83,8 +82,8 @@ def detect_block_cuts(tt):
         return []
     return list(tt[1:][dt > 1.3 * hop])
 
-# Panel
-def make_panel(df, band, roi, args, scale_cache, value_col):
+# --------------------------- panel --------------------------------------------
+def render_heatmap_panel(df, band, roi, args, scale_cache, value_col):
     sub = df[(df["band"] == band) & (df["region"] == roi) & (df["group"].isin(GROUPS))].copy()
     if sub.empty:
         print(f"[WARN] No data for {band} / {roi}.")
@@ -100,15 +99,15 @@ def make_panel(df, band, roi, args, scale_cache, value_col):
             if args.scale == "band":
                 key = ("band", band)
                 if key not in scale_cache:
-                    scale_cache[key] = robust_limits(df.loc[df["band"] == band, value_col].values, 5, 95)
+                    scale_cache[key] = compute_value_range(df.loc[df["band"] == band, value_col].values, 5, 95)
                 vmin, vmax = scale_cache[key]
             elif args.scale == "global":
                 key = ("global",)
                 if key not in scale_cache:
-                    scale_cache[key] = robust_limits(df[value_col].values, 5, 95)
+                    scale_cache[key] = compute_value_range(df[value_col].values, 5, 95)
                 vmin, vmax = scale_cache[key]
             else:
-                vmin, vmax = robust_limits(sub[value_col].values, 5, 95)
+                vmin, vmax = compute_value_range(sub[value_col].values, 5, 95)
 
     fig, axes = plt.subplots(4, 3, figsize=(14, 12), sharex=False, sharey=False)
     summary_rows = []
@@ -123,7 +122,7 @@ def make_panel(df, band, roi, args, scale_cache, value_col):
 
             d_pair = sub[(sub["visual_state"] == state) & (sub["group"] == group) &
                          (sub["session"].isin(SESSIONS))].copy()
-            sids = subject_order_for_pair(d_pair, args.sort, value_col)
+            sids = order_subjects_for_pair(d_pair, args.sort, value_col)
 
             d_this = d_group[d_group["session"] == session]
             if d_this.empty:
@@ -144,7 +143,7 @@ def make_panel(df, band, roi, args, scale_cache, value_col):
             )
             yticks = np.arange(len(sids)) + 0.5
             ax.set_yticks(yticks)
-            ax.set_yticklabels(format_ids(sids, args.id_format), fontsize=9)
+            ax.set_yticklabels(format_subject_ids(sids, args.id_format), fontsize=9)
 
             ax.set_ylabel(f"{state}-{session}" if col_idx == 0 else "", fontsize=12)
             if row_idx == 0:
@@ -152,14 +151,13 @@ def make_panel(df, band, roi, args, scale_cache, value_col):
             ax.set_xlabel("Time (s)")
 
             if args.mark_blocks == "on":
-                for xc in detect_block_cuts(tt):
+                for xc in detect_time_block_boundaries(tt):
                     ax.axvline(xc, color="k", ls="--", lw=0.8, alpha=0.25)
 
-            from numpy import trapz
             for sid in sids:
                 d_sid = d_group[(d_group["session"] == session) & (d_group["subject"].astype(str) == sid)]
                 m = float(d_sid[value_col].mean()) if len(d_sid) else np.nan
-                auc = float(trapz(d_sid[value_col].values, x=d_sid["t_sec"].values)) if len(d_sid) else np.nan
+                auc = float(trapezoid(d_sid[value_col].values, x=d_sid["t_sec"].values)) if len(d_sid) else np.nan
                 summary_rows.append(dict(
                     band=band, region=roi, group=group, state=state, session=session,
                     subject=str(sid), mean=m, auc=auc
@@ -177,7 +175,7 @@ def make_panel(df, band, roi, args, scale_cache, value_col):
 
     return fig, pd.DataFrame(summary_rows)
 
-# Main
+# ----------------------------- main -------------------------------------------
 def main():
     p = argparse.ArgumentParser(description="PRE vs POST heatmaps (EO/EC) by group.")
     p.add_argument("--metric", choices=["power_rel", "power_abs", "both"], default="both")
@@ -201,15 +199,18 @@ def main():
     if miss:
         raise SystemExit(f"Missing base columns in CSV: {miss}")
 
-    bands_all = list(df["band"].dropna().unique())
-    if BANDS_ORDER:
-        order_idx = {b:i for i,b in enumerate(BANDS_ORDER)}
-        bands_all.sort(key=lambda b: order_idx.get(b, 999))
-    rois_all = list(df["region"].dropna().unique())
-    if ROIS_ORDER:
-        roi_idx = {r:i for i,r in enumerate(ROIS_ORDER)}
-        rois_all.sort(key=lambda r: roi_idx.get(r, 999))
+    # Enforce canonical category orders for deterministic grouping/labels
+    df["band"]         = pd.Categorical(df["band"], BANDS_ORDER, ordered=True)
+    df["region"]       = pd.Categorical(df["region"], ROIS_ORDER,  ordered=True)
+    df["group"]        = pd.Categorical(df["group"], GROUPS,       ordered=True)
+    df["session"]      = df["session"].astype(str).str.upper().map({"PRE":"PRE","POS":"POST","POST":"POST"})
+    df["session"]      = pd.Categorical(df["session"], SESSIONS,   ordered=True)
+    df["visual_state"] = pd.Categorical(df["visual_state"].astype(str).str.upper(), STATES, ordered=True)
+    df["subject"]      = df["subject"].astype(str).str.zfill(2)
 
+    # Resolve band/ROI selection
+    bands_all = [b for b in BANDS_ORDER if b in df["band"].cat.categories]
+    rois_all  = [r for r in ROIS_ORDER  if r in df["region"].cat.categories]
     bands = args.bands or bands_all
     rois  = args.rois  or rois_all
 
@@ -226,7 +227,7 @@ def main():
     for m in metrics:
         for band in bands:
             for roi in rois:
-                fig, df_sum = make_panel(df, band, roi, args, scale_cache, value_col=m)
+                fig, df_sum = render_heatmap_panel(df, band, roi, args, scale_cache, value_col=m)
                 if fig is None:
                     continue
                 tag = "REL" if m == "power_rel" else "ABS"
@@ -234,7 +235,7 @@ def main():
                 out_png = OUT_DIR / stem
                 fig.savefig(out_png, dpi=300, bbox_inches="tight")
                 plt.close(fig)
-                print(f"🖼️ saved: {out_png}")
+                print(f"Saved: {out_png}")
 
                 if args.export_summary == "on" and df_sum is not None and not df_sum.empty:
                     piv = df_sum.pivot_table(index=["band","region","group","state","subject"],
@@ -254,7 +255,7 @@ def main():
 
                     out_csv = OUT_DIR / f"summary_{band}_{roi.replace(' ','_').replace('/','-')}_{tag}.csv"
                     piv.to_csv(out_csv, index=False)
-                    print(f"📄 summary saved: {out_csv}")
+                    print(f"Saved summary: {out_csv}")
 
 if __name__ == "__main__":
     main()

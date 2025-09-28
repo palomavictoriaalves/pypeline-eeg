@@ -1,4 +1,3 @@
-# code/plot_mirror_EO_EC_points.py
 """Mirror plots per BAND×ROI with individual points (no PRE↔POST links).
 Reads : results/power/power_long_by_region_EO_EC.xlsx
 Writes: results/plots/mirror_by_region_rel|abs/*.png
@@ -12,7 +11,7 @@ from matplotlib.ticker import FuncFormatter
 
 import config
 
-# Paths / config
+# Paths / config (mandatory)
 POWER_DIR = config.POWER_DIR
 PLOTS_DIR = config.PLOTS_DIR
 OUT_REL   = PLOTS_DIR / "mirror_by_region_rel"
@@ -52,7 +51,7 @@ df["session"]      = pd.Categorical(df["session"], SESS,       ordered=True)
 df["visual_state"] = pd.Categorical(df["visual_state"].str.upper(), STATES, ordered=True)
 df["subject"]      = df["subject"].astype(str).str.zfill(2)
 
-# Error functions (95% CI; fallback to SE)
+# --- error bars (95% CI; falls back to SE if SciPy unavailable) ---------------
 def _se(x):
     x = np.asarray(x, dtype=float)
     x = x[~np.isnan(x)]
@@ -71,10 +70,10 @@ try:
 except Exception:
     ERR_LABEL = "se"
     err_func = _se
-    print("⚠️ SciPy not found: using SE instead of 95% CI.")
+    print("SciPy not found: using SE instead of 95% CI.")
 
-# Axis formatter (|value| with adaptive precision)
-def make_adaptive_abs_formatter(ax):
+# --- formatters & summaries ---------------------------------------------------
+def make_abs_formatter(ax):
     def _fmt(v, _pos):
         vmax = max(abs(ax.get_xlim()[0]), abs(ax.get_xlim()[1]))
         if vmax >= 1:       return f"{abs(v):.2f}"
@@ -84,8 +83,8 @@ def make_adaptive_abs_formatter(ax):
         else:               return f"{abs(v):.2e}"
     return FuncFormatter(_fmt)
 
-# Summaries and symmetric x-limits
-def build_summary_and_xlim(df_use: pd.DataFrame, value_col: str):
+def compute_summary_and_xlim(df_use: pd.DataFrame, value_col: str):
+    """Return (summary_df, xmax_by_band) for symmetric mirror axes."""
     summary = (
         df_use.groupby(["band","region","group","session","visual_state"], as_index=False)[value_col]
               .agg(mean="mean", **{ERR_LABEL: err_func}, n="count")
@@ -96,20 +95,22 @@ def build_summary_and_xlim(df_use: pd.DataFrame, value_col: str):
         if sub.empty:
             continue
         err = sub[ERR_LABEL].fillna(0.0)
+        # Candidate from means ± error
         x_from_mean = float(np.nanmax(sub["mean"] + err))
         if not np.isfinite(x_from_mean) or x_from_mean <= 0:
             x_from_mean = float(np.nanmax(sub["mean"])) if np.isfinite(np.nanmax(sub["mean"])) else 0.0
+        # Candidate from raw points
         pts = df_use[df_use["band"] == band][value_col].values
         x_from_pts = float(np.nanmax(np.abs(pts))) if pts.size else 0.0
         xmax = max(x_from_mean, x_from_pts)
         xmax_by_band[band] = (xmax if np.isfinite(xmax) and xmax > 0 else 1.0) * 1.12
     return summary, xmax_by_band
 
-# Plot
-def plot_mirror_with_points(band: str, region: str, out_dir: Path,
-                            df_base: pd.DataFrame, summary: pd.DataFrame,
-                            xmax_by_band: dict, value_col: str):
-
+# --- plotting -----------------------------------------------------------------
+def plot_mirror_points(band: str, region: str, out_dir: Path,
+                       df_base: pd.DataFrame, summary: pd.DataFrame,
+                       xmax_by_band: dict, value_col: str):
+    """Mirror plot with mean±error bars and individual points."""
     sub_bar = summary[(summary["band"]==band) & (summary["region"]==region)].copy()
     if sub_bar.empty:
         print(f"No data for {band} / {region}")
@@ -122,7 +123,7 @@ def plot_mirror_with_points(band: str, region: str, out_dir: Path,
 
     y_pos  = {g:i for i,g in enumerate(GROUPS)}
     vshift = {"EO": +0.17, "EC": -0.17}
-    rng    = np.random.default_rng(12345)
+    rng    = np.random.default_rng(12345)  # deterministic jitter
 
     fig, ax = plt.subplots(figsize=(12, 7))
 
@@ -171,7 +172,7 @@ def plot_mirror_with_points(band: str, region: str, out_dir: Path,
         xmax = 1.0
     ax.set_xlim(-xmax, xmax)
     ax.margins(x=0.04)
-    ax.xaxis.set_major_formatter(make_adaptive_abs_formatter(ax))
+    ax.xaxis.set_major_formatter(make_abs_formatter(ax))
 
     unit = "Relative Power (within-ROI proportion)" if value_col=="power_rel" else r"Absolute Power ($\mu V^2/Hz$)"
     err_title = "95% CI" if ERR_LABEL == "ci95" else "SE"
@@ -197,17 +198,17 @@ def plot_mirror_with_points(band: str, region: str, out_dir: Path,
     plt.tight_layout()
     plt.savefig(out, dpi=300, bbox_inches="tight")
     plt.close()
-    print(f"🖼️ saved: {out}")
+    print(f"Saved: {out}")
 
 # Run for REL and ABS
 for VALUE_COL, out_dir in [("power_rel", OUT_REL), ("power_abs", OUT_ABS)]:
-    summary, xmax_by_band = build_summary_and_xlim(df, VALUE_COL)
+    summary, xmax_by_band = compute_summary_and_xlim(df, VALUE_COL)
     for band in BANDS_ORDER:
         for region in ROIS_ORDER:
-            plot_mirror_with_points(
+            plot_mirror_points(
                 band, region, out_dir,
                 df_base=df, summary=summary,
                 xmax_by_band=xmax_by_band, value_col=VALUE_COL
             )
 
-print("\n🎉 Mirror plots generated for REL and ABS.")
+print("Mirror plots generated for REL and ABS.")

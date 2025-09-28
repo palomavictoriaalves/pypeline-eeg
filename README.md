@@ -1,7 +1,9 @@
-# EEG Pipeline (BIDS) — PRE/POST & EO/EC
+# PYPELINE-EEG
 
-A complete pipeline to **preprocess**, **quantify**, and **visualize** EEG power in studies with **PRE/POST** sessions and **eyes-open (EO) / eyes-closed (EC)** conditions.  
-Inputs follow **BIDS** (BrainVision); outputs are **publication-ready** CSVs and figures.
+A complete pipeline to **preprocess**, **quantify**, and **visualize** EEG power in studies with **customizable** sessions and experimental conditions.
+Inputs follow BIDS; outputs are publication-ready CSVs and figures.
+
+![Step-by-step](assets/steps.png)
 
 ---
 
@@ -12,20 +14,22 @@ Inputs follow **BIDS** (BrainVision); outputs are **publication-ready** CSVs and
 ├─ code/
 │  ├─ preprocess.py                         # BIDS-aware preprocessing for BrainVision
 │  ├─ calc_power.py                         # builds wide power tables (ABS/REL)
-│  ├─ calc_timeseries_power.py              # (optional) time-series data assembly
-│  ├─ plot_timeseries_all_EC_EO.py          # EO/EC time-series per band × ROI (2×3 panels)
-│  ├─ plot_topomaps_grid_EO_EC.py           # topographic grids (EO vs EC, etc.)
-│  ├─ plot_heat_all_bands_timeseries.py     # heatmaps of temporal power by band
-│  ├─ plot_mirror_EO_EC_points.py           # mirror/bar/point plots (EO vs EC)
+│  ├─ calc_timeseries_power.py              # time-series data assembly
+│  ├─ plot_timeseries_all_EC_EO.py          # visualization: time-series per band × ROI
+│  ├─ plot_topomaps_grid_EO_EC.py           # visualization: topographic grids
+│  ├─ plot_heat_all_bands_timeseries.py     # visualization: heatmaps of temporal power by band
+│  ├─ plot_mirror_EO_EC_points.py           # visualization: mirror/bar/point plots
 │  ├─ calc_stats_power.py                   # minimal paired stats from wide power tables
-│  └─ config.py                             # study parameters and paths
-├─ data/                                    # BIDS input (read-only)
+│  └─ config.py                             # parameters and paths
+├─ data/                                    # BIDS input
 │  └─ sub-XX[/ses-YY]/eeg/*.vhdr + .eeg + .vmrk (+ .json)
 ├─ results/                                 # derivatives (generated)
 │  ├─ processed/                            # preprocessed FIFs (concat, EO, EC + manifest)
 │  ├─ power/                                # wide power tables (abs/rel)
-│  ├─ timeseries/                           # per-ROI×band temporal data (optional)
+│  ├─ timeseries/                           # per-ROI×band temporal data
 │  └─ plots/                                # figures and CSVs
+├─ assets/
+│  └─ steps.png
 ├─ requirements.txt
 └─ LICENSE.txt
 ```
@@ -34,17 +38,21 @@ Inputs follow **BIDS** (BrainVision); outputs are **publication-ready** CSVs and
 
 ---
 
-## Requirements
+## Installation
 
-- **Python 3.9+** (3.10–3.12 recommended)
-- Install dependencies:
-  ```bash
-  pip install -r requirements.txt
-  ```
-  Or manually:
-  ```bash
-  pip install mne mne-icalabel numpy pandas matplotlib scipy
-  ```
+- **Python 3.9+** (3.12 recommended)
+- From the **project root**, install pinned dependencies:
+
+```bash
+# (optional) create a virtual environment
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+
+# install exact versions
+pip install -r requirements.txt
+```
+
+> Using `requirements.txt` guarantees the versions used in the paper’s analyses.
 
 ---
 
@@ -65,7 +73,7 @@ data/
 └─ sub-02/ ...
 ```
 
-> Each `.vhdr` **must** correctly reference its `.eeg`/`.vmrk`. If links are broken, fix them (e.g., with a helper like `fix_brainvision_links.py`) before preprocessing.
+> Each `.vhdr` **must** correctly reference its `.eeg`/`.vmrk`. 
 
 ---
 
@@ -212,74 +220,94 @@ python code/plot_mirror_EO_EC_points.py
 
 ---
 
-## Script summaries
+## Detailed script descriptions
 
 ### `code/preprocess.py`
-- Recursively finds `*.vhdr` under `data/**/eeg/`.
-- Parses BIDS entities (sub, ses, task, run) from file names.
-- Processing: band-pass + notch, average reference, EO/EC segmentation via `BLOCKS_WITH_STATE`, ICA (Infomax extended), **ICLabel**-based IC rejection, EO/EC annotations.
-- Saves per subject/session:
-  - concatenated: `*_desc-preproc_clean_raw.fif`
-  - EO-only:      `*_desc-preproc_EO_clean_raw.fif`
-  - EC-only:      `*_desc-preproc_EC_clean_raw.fif`
-  - block manifest: `*_desc-preproc_blocks_manifest.csv`
+**Purpose:** BIDS-aware EEG preprocessing (BrainVision) and derivatives generation.  
+**Inputs:** `data/**/eeg/*.vhdr` (+ `.eeg`, `.vmrk`).  
+**Outputs:** `results/processed/**/eeg/`
+- `*_desc-preproc_clean_raw.fif` (concatenated)
+- `*_desc-preproc_EO_clean_raw.fif`
+- `*_desc-preproc_EC_clean_raw.fif`
+- `*_desc-preproc_blocks_manifest.csv`  
+**Key steps:** montage `standard_1020`, band-pass `[FILTER_LOW, FILTER_HIGH]`, notch `NOTCH_HZ`, average reference, EO/EC segmentation via `BLOCKS_WITH_STATE`, ICA (Infomax, `random_state=97`), auto IC rejection with **ICLabel**, `visual_state:*` annotations.
 
-### `code/plot_timeseries_all_EC_EO.py`
-- Recursively finds `*_clean_raw.fif` under `results/processed/**/eeg/`.
-- Parses subject, session (PRE/POST), and state (EO/EC) from filenames (BIDS + legacy tolerated).
-- Computes sliding-window PSD (Welch) per band; aggregates by **ROI** (`ROI_CHANNELS`).
-- Aligns EO/EC per subject → mean ± 95% CI; optional BH-FDR marking across time.
-- Saves long CSV and 2×3 panel figures (PRE/POST × groups).
+---
 
-### `code/calc_power.py` & `code/calc_timeseries_power.py`
-- Build wide or long tables for power metrics (ABS and REL), feeding `results/power/` and/or `results/timeseries/`.
+### `code/calc_power.py`
+**Purpose:** Compute **absolute (ABS)** and **relative (REL)** power per **Band × ROI** (EO/EC, PRE/POST).  
+**Inputs:** `results/processed/**/eeg/*_desc-preproc_(clean_raw|EO|EC)_clean_raw.fif`, `*_blocks_manifest.csv`.  
+**Outputs:** `results/power/`
+- `power_long_by_region_EO_EC.xlsx`
+- `power_wide_abs_EO_EC.csv`
+- `power_wide_rel_EO_EC.csv`
+- `roi_coverage_EO_EC.csv`  
+**Notes:** REL = band / total ([`PSD_FMIN`, `PSD_FMAX`]); deterministic ordering controlled by `config` lists.
+
+### `code/calc_timeseries_power.py`
+**Purpose:** Extract sliding-window power time series (ABS/REL) per **Band × ROI**.  
+**Inputs:** Preprocessed FIFs in `results/processed/**/eeg/`.  
+**Outputs:** `results/timeseries/`
+- `ts_power_long.csv`
+- `readme_params.json` (parameters used)  
+**Notes:** windows of `TS_WIN_SEC` with step `TS_STEP_SEC`; Welch per `WELCH_SEG_SEC`; EO/EC inferred from annotations or separate files.
 
 ### `code/calc_stats_power.py`
-- Reads wide power tables, reshapes to long, and runs paired tests:
-  - **EC vs EO** within session
-  - **POST vs PRE** within visual state
-- Chooses paired t-test vs Wilcoxon based on Shapiro–Wilk normality of differences; reports Cohen’s d_z and significance stars.
+**Purpose:** Minimal paired stats from wide power tables.  
+**Inputs:** `results/power/power_wide_{abs,rel}_EO_EC.csv`.  
+**Outputs:** `results/stats/{abs,rel}/`
+- `stats_*_EOvsEC.csv`
+- `stats_*_POSTvsPRE.csv`  
+**Key steps:** normality check (Shapiro–Wilk) → paired `ttest_rel` or `wilcoxon`; reports means, Δ, p-values, significance stars, and **Cohen’s d_z**.
 
-### `code/plot_topomaps_grid_EO_EC.py`, `code/plot_heat_all_bands_timeseries.py`, `code/plot_mirror_EO_EC_points.py`
-- Additional visualization options (topographies, temporal heatmaps, and EO/EC mirror/point plots).
+---
+
+### `code/plot_timeseries_all_EC_EO.py`
+**Purpose:** Create 2×3 panels (PRE/POST × groups) with EO/EC ± 95% CI over time.  
+**Inputs:** `results/processed/**/eeg/*_clean_raw.fif`.  
+**Outputs:** `results/plots/timeseries_all/`
+- `csv/timeseries_all_bands_rois_relabs.csv`
+- `figs/timeseries_<Band>_<metric>_<ROI>.png`  
+**Notes:** PSD sliding windows; aggregation by `ROI_CHANNELS`; EO/EC alignment per subject; optional BH-FDR marking (`TS_FDR_ALPHA`).
+
+### `code/plot_topomaps_grid_EO_EC.py`
+**Purpose:** 2×3 topographic grids (EO/EC × groups) showing **POST − PRE** per band.  
+**Inputs:** Preprocessed FIFs.  
+**Outputs:** `results/plots/topomaps_grid_{rel,abs}/topogrid_{relDiff|absDiff}_<Band>.png`  
+**Notes:** mean per channel inside each band; REL normalized by total; color limits shared per band/state.
+
+### `code/plot_heat_all_bands_timeseries.py`
+**Purpose:** Time × participant heatmaps (rows: EO/EC × PRE/POST; columns: groups).  
+**Inputs:** `results/timeseries/ts_power_long.csv`.  
+**Outputs:** `results/plots/timeseries_heatmaps_prepost/`
+- `heat_PREPOST_<Band>_<ROI>_{REL|ABS}_<order>.png`
+- `summary_<Band>_<ROI>_{REL|ABS}.csv` (mean & AUC per subject; outlier flag)  
+**Notes:** color scale options (panel/band/global); subject ordering configurable; AUC computed via `scipy.integrate.trapezoid`.
+
+### `code/plot_mirror_EO_EC_points.py`
+**Purpose:** Mirror/bar/point plots for **Band × ROI**.  
+**Inputs:** `results/power/power_long_by_region_EO_EC.xlsx`.  
+**Outputs:**  
+- `results/plots/mirror_by_region_rel/mirror_<Band>_<ROI>.png`
+- `results/plots/mirror_by_region_abs/mirror_<Band>_<ROI>.png`  
+**Notes:** PRE left / POST right; error bars = 95% CI (or SE if SciPy unavailable); outliers flagged when |z| ≥ 2.
 
 ---
 
 ## Units & definitions
 
-- **Absolute power (ABS)**: band-averaged PSD in **V²/Hz**. Values are often small; consider exporting with higher precision or scaling to **µV²/Hz** (`× 1e6`) for readability.
-- **Relative power (REL)**: `(band power) / (total power)` with total spanning `[PSD_FMIN, min(PSD_FMAX, Nyquist-1 Hz)]`.
-- **Time-series**: windows of `TS_WIN_SEC` with step `TS_STEP_SEC`; Welch params from `WELCH_SEG_SEC` and `WELCH_OVERLAP`.
-
----
-
-## Troubleshooting
-
-- **“No data extracted” in time-series**
-  - Confirm `config.PROJECT_ROOT = SCRIPT_PATH.parent.parent` (since `config.py` is in `code/`).
-  - Verify that FIF names include `*_clean_raw.fif` and encode `ses-pre/ses-post` and `EO/EC` (as produced by `preprocess.py`).
-  - If EEG channel **types** are missing, the time-series script falls back to **name-based** selection using `ROI_CHANNELS`.
-
-- **Deprecation warnings about `pick_types`**
-  - The scripts use the modern API (`raw.pick("eeg")`, `raw.pick(<list>)`). Update any leftovers accordingly.
-
-- **ABS means appear as `0.0` in stats**
-  - Increase rounding precision when writing CSVs or scale ABS to µV²/Hz. This is a display/precision issue, not “all-zero” data.
+- **Absolute power (ABS)**: band-averaged PSD in **V²/Hz**. Consider scaling to **µV²/Hz** for readability.
+- **Relative power (REL)**: band / total power over `[PSD_FMIN, min(PSD_FMAX, Nyquist−1 Hz)]`.
+- **Time-series**: windows of `TS_WIN_SEC` with step `TS_STEP_SEC`; Welch parameters from `WELCH_SEG_SEC` and `WELCH_OVERLAP`.
 
 ---
 
 ## Reproducibility notes
 
-- Record `python`, `mne`, and `mne-icalabel` versions.
-- Keep `config.py` in version control (document changes to filters, bands, windows).
-- Preserve `*_blocks_manifest.csv` for audit trail of EO/EC segmentation.
+- Pin and report `python`, `mne`, and `mne-icalabel` versions (see `requirements.txt`).
+- Keep `config.py` under version control; document any changes.
+- Preserve `*_blocks_manifest.csv` for segmentation provenance.
 - Fixed randomness: `ICA(..., random_state=97)`.
-
----
-
-## Citation
-
-If this pipeline contributes to a publication, please cite **MNE-Python** and **ICLabel** and reference this repository.
 
 ---
 
@@ -290,4 +318,4 @@ See [`LICENSE.txt`](LICENSE.txt).
 
 ---
 
-**Questions or issues?** Open an issue with the command used, a short description of your data layout, and the full error output (traceback).
+**Questions or issues?** Open an issue with the command used, your data layout (BIDS path), and the full traceback.
