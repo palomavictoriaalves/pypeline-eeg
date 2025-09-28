@@ -318,4 +318,6 @@ See [`LICENSE.txt`](LICENSE.txt).
 
 ---
 
-**Questions or issues?** Open an issue with the command used, your data layout (BIDS path), and the full traceback.
+**Questions or issues?** [Open an issue](https://github.com/palomavictoriaalves/pypeline-eeg/issues/new)
+ with the command you ran, your data layout (BIDS path), and the full error traceback.
+If you prefer, you can also contact the maintainer by email: [palomavictoria14@gmail.com](mailto:palomavictoria14@gmail.com)
