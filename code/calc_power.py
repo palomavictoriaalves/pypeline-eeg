@@ -1,4 +1,4 @@
-"""Compute band × ROI power (absolute/relative) for EO/EC and PRE/POST."""
+"""Compute band × ROI power (absolute/relative)"""
 
 from pathlib import Path
 import re
