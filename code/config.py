@@ -100,4 +100,11 @@ TS_FDR_ALPHA      = 0.05
 TS_MARK_SIG       = True
 TS_GENERATE_PLOTS = True
 
+TS_USE_FIRST_BLOCK_ONLY = True
+
+
+TS_FIXED_X_WINDOWS = {
+    "EO": (15.0, 55.0),
+    "EC": (150.0, 190.0),
+}
 ROI_CHANNELS = REGIONS

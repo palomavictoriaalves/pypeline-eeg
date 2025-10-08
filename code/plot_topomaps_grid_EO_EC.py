@@ -1,5 +1,5 @@
 """2×3 panel (EO/EC × Active/Passive/Control) per band; POST−PRE topomaps.
-Exports REL and ABS versions.
+Exports REL (Δ%) and ABS (Δ dB) with per-channel FDR masking.
 """
 
 from pathlib import Path
@@ -8,37 +8,37 @@ import numpy as np
 import mne
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+from scipy.stats import ttest_1samp
+from mne.stats import fdr_correction
 
 import config
 
-PROCESSED_DIR  = config.PROCESSED_DIR
-OUT_REL        = config.PLOTS_DIR / "topomaps_grid_rel"
-OUT_ABS        = config.PLOTS_DIR / "topomaps_grid_abs"
+PROCESSED_DIR = config.PROCESSED_DIR
+OUT_REL = config.PLOTS_DIR / "topomaps_grid_rel"
+OUT_ABS = config.PLOTS_DIR / "topomaps_grid_abs"
 OUT_REL.mkdir(parents=True, exist_ok=True)
 OUT_ABS.mkdir(parents=True, exist_ok=True)
 
-BANDS          = config.BANDS
-BANDS_ORDER    = config.BANDS_ORDER
-PSD_FMIN       = config.PSD_FMIN
-PSD_FMAX       = config.PSD_FMAX
-WELCH_SEG_SEC  = config.WELCH_SEG_SEC
-WELCH_OVERLAP  = config.WELCH_OVERLAP
+BANDS = config.BANDS
+BANDS_ORDER = config.BANDS_ORDER
+PSD_FMIN = config.PSD_FMIN
+PSD_FMAX = config.PSD_FMAX
+WELCH_SEG_SEC = config.WELCH_SEG_SEC
+WELCH_OVERLAP = config.WELCH_OVERLAP
 
-GROUPS         = config.GROUPS_ORDER
-STATES         = config.VS_ORDER
-GROUP_ACTIVE   = set(config.GROUP_ACTIVE)
-GROUP_PASSIVE  = set(config.GROUP_PASSIVE)
-GROUP_CONTROL  = set(config.GROUP_CONTROL)
+GROUPS = config.GROUPS_ORDER
+STATES = config.VS_ORDER
+GROUP_ACTIVE = set(config.GROUP_ACTIVE)
+GROUP_PASSIVE = set(config.GROUP_PASSIVE)
+GROUP_CONTROL = set(config.GROUP_CONTROL)
 
-# --- subject → group ----------------------------------------------------------
 def infer_group_from_subject(sub: str) -> str:
     sid = str(sub).zfill(2)
-    if sid in GROUP_ACTIVE:  return GROUPS[0]  # "Active"
-    if sid in GROUP_PASSIVE: return GROUPS[1]  # "Passive"
-    if sid in GROUP_CONTROL: return GROUPS[2]  # "Control"
+    if sid in GROUP_ACTIVE:  return GROUPS[0]
+    if sid in GROUP_PASSIVE: return GROUPS[1]
+    if sid in GROUP_CONTROL: return GROUPS[2]
     return "Unknown"
 
-# --- BIDS helpers -------------------------------------------------------------
 _BIDS_DERIV_RE = re.compile(
     r"(?P<sub>sub-\d+)"
     r"(?:_(?P<ses>ses-[a-z0-9]+))?"
@@ -82,7 +82,7 @@ def parse_bids_from_name(path: Path):
     }
 
 def load_state_raw(dir_eeg: Path, base: str, state: str):
-    """Open <base>_{EO|EC}_clean_raw.fif if present; else crop from <base>_clean_raw.fif."""
+    """Prefer <base>_{EO|EC}_clean_raw.fif; otherwise crop state from <base>_clean_raw.fif."""
     direct = dir_eeg / f"{base}_{state}_clean_raw.fif"
     if direct.exists():
         try:
@@ -96,13 +96,15 @@ def load_state_raw(dir_eeg: Path, base: str, state: str):
             raw_all = mne.io.read_raw_fif(concat, preload=True, verbose="ERROR")
             if not raw_all.annotations or len(raw_all.annotations) == 0:
                 return None
-            sf = float(raw_all.info.get("sfreq", 250.0)); eps = 1.0 / sf
+            sf = float(raw_all.info.get("sfreq", 250.0))
+            eps = 1.0 / sf
             pieces = []
             for desc, onset, dur in zip(raw_all.annotations.description,
                                         raw_all.annotations.onset,
                                         raw_all.annotations.duration):
                 if desc == f"visual_state:{state}" and dur > 0:
-                    t0 = float(onset); t1 = min(float(onset + dur), float(raw_all.times[-1]) - eps)
+                    t0 = float(onset)
+                    t1 = min(float(onset + dur), float(raw_all.times[-1]) - eps)
                     if t1 > t0:
                         pieces.append(raw_all.copy().crop(tmin=t0, tmax=t1))
             if not pieces:
@@ -113,11 +115,11 @@ def load_state_raw(dir_eeg: Path, base: str, state: str):
             print(f"WARNING: cannot crop {concat.name}: {e}")
     return None
 
-# --- PSD per-channel for a band ----------------------------------------------
 def psd_band_by_channel(raw, fmin_band, fmax_band):
+    """Welch PSD per channel; returns (abs, rel, channel_names)."""
     raw = raw.copy().pick("eeg")
     sf = float(raw.info["sfreq"])
-    fmax_eff = min(PSD_FMAX, sf/2.0 - 1.0)
+    fmax_eff = min(PSD_FMAX, sf / 2.0 - 1.0)
     n_per_seg = max(16, int(round(WELCH_SEG_SEC * sf)))
     n_overlap = int(round(WELCH_OVERLAP * n_per_seg))
     spec = raw.compute_psd(
@@ -127,11 +129,11 @@ def psd_band_by_channel(raw, fmin_band, fmax_band):
         picks="eeg", verbose="ERROR",
     )
     psds, freqs = spec.get_data(return_freqs=True)
-    band_mask  = (freqs >= fmin_band) & (freqs <= fmax_band)
-    total_mask = (freqs >= PSD_FMIN)  & (freqs <= fmax_eff)
+    band_mask = (freqs >= fmin_band) & (freqs <= fmax_band)
+    total_mask = (freqs >= PSD_FMIN) & (freqs <= fmax_eff)
     abs_band = psds[:, band_mask].mean(axis=1)
-    total    = psds[:, total_mask].mean(axis=1)
-    with np.errstate(divide='ignore', invalid='ignore'):
+    total = psds[:, total_mask].mean(axis=1)
+    with np.errstate(divide="ignore", invalid="ignore"):
         rel_band = abs_band / np.where(total > 0, total, np.nan)
     return abs_band, rel_band, raw.ch_names
 
@@ -140,29 +142,26 @@ def make_info(ch_names, sfreq=250.0):
     info.set_montage("standard_1020")
     return info
 
-# --- collect PRE/POST bases ---------------------------------------------------
+# --- collect PRE/POST bases
 concat_files = sorted(PROCESSED_DIR.rglob("*_desc-preproc_clean_raw.fif"))
-
 bank = {}  # (sub_num, state) -> {"PRE": (dir_eeg, base), "POST": (...)}
 for f in concat_files:
     info = parse_bids_from_name(f)
     if not info:
         continue
     dir_eeg = f.parent
-    base    = info["base"]
-    sub     = subject_two_digit(info["sub"])
-    sess    = session_label_prepost(info.get("ses"))
+    base = info["base"]
+    sub = subject_two_digit(info["sub"])
+    sess = session_label_prepost(info.get("ses"))
     if sess not in {"PRE", "POST"}:
         continue
     for state in STATES:
-        # We can always attempt to crop from the concatenated file if split files don't exist.
         bank.setdefault((sub, state), {})[sess] = (dir_eeg, base)
 
 pairs = [((sub, state), sesmap) for (sub, state), sesmap in bank.items() if "PRE" in sesmap and "POST" in sesmap]
 print(f"Valid PRE/POST pairs: {len(pairs)}")
 
-# --- precompute per subject/state/band ----------------------------------------
-# cache[(sub, state, sess, band)] = {"abs": array(n_ch), "rel": array(n_ch), "ch": ch_names}
+# --- cache per subject/state/band
 cache = {}
 for (sub, state), sesmap in pairs:
     for sess in ("PRE", "POST"):
@@ -179,13 +178,13 @@ for (sub, state), sesmap in pairs:
             abs_v, rel_v, chs = psd_band_by_channel(raw, fmin_b, fmax_b)
             cache[(sub, state, sess, band)] = {"abs": abs_v, "rel": rel_v, "ch": chs}
 
-# --- compute POST−PRE deltas --------------------------------------------------
 def compute_post_minus_pre_deltas(metric: str):
+    """metric: 'rel' -> Δ% ; 'abs' -> Δ dB."""
     results = {st: {b: [] for b in BANDS} for st in STATES}
     for (sub, state), sesmap in pairs:
         grp = infer_group_from_subject(sub)
         for band in BANDS.keys():
-            pre  = cache.get((sub, state, "PRE",  band))
+            pre = cache.get((sub, state, "PRE", band))
             post = cache.get((sub, state, "POST", band))
             if pre is None or post is None:
                 continue
@@ -193,28 +192,38 @@ def compute_post_minus_pre_deltas(metric: str):
             common = [ch for ch in ch_pre if ch in ch_post]
             if len(common) < 8:
                 continue
-            idx_pre  = [ch_pre.index(ch)  for ch in common]
+            idx_pre = [ch_pre.index(ch) for ch in common]
             idx_post = [ch_post.index(ch) for ch in common]
-            delta = (post["rel"][idx_post] - pre["rel"][idx_pre]) if metric == "rel" \
-                    else (post["abs"][idx_post] - pre["abs"][idx_pre])
+
+            if metric == "rel":
+                pre_rel = pre["rel"][idx_pre]
+                post_rel = post["rel"][idx_post]
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    delta = 100.0 * (post_rel - pre_rel) / np.where(pre_rel != 0, pre_rel, np.nan)
+            else:
+                post_db = 10 * np.log10(post["abs"][idx_post])
+                pre_db = 10 * np.log10(pre["abs"][idx_pre])
+                delta = post_db - pre_db
+
             results[state][band].append({"sub": sub, "group": grp, "ch": common, "delta": delta})
     return results
 
-# --- plot 2×3 grid for a band -------------------------------------------------
-FIGSIZE      = (13.0, 7.8)
-GRID_WSPACE  = 0.12
-GRID_HSPACE  = 0.30
-CBAR_WIDTH   = 0.045
-TITLE_Y      = 0.99
-MARGINS      = dict(left=0.08, right=0.95, top=0.90, bottom=0.06)
+FIGSIZE = (13.0, 7.8)
+GRID_WSPACE = 0.12
+GRID_HSPACE = 0.30
+CBAR_WIDTH = 0.045
+TITLE_Y = 0.99
+MARGINS = dict(left=0.08, right=0.95, top=0.90, bottom=0.06)
 COL_TITLE_PAD = 10
 
 def plot_topomap_grid_for_band(band: str, results, metric: str, out_dir: Path):
-    data_rows, ch_common = {}, {}
+    """2×3 grid; one-sample t vs 0 on Δ with FDR q=.05."""
+    row_data, ch_common = {}, {}
+
     for state in STATES:
         lst = results[state][band]
         if not lst:
-            data_rows[state] = None
+            row_data[state] = None
             ch_common[state] = []
             continue
         inter = set(lst[0]["ch"])
@@ -223,36 +232,42 @@ def plot_topomap_grid_for_band(band: str, results, metric: str, out_dir: Path):
         inter = [ch for ch in lst[0]["ch"] if ch in inter]
         ch_common[state] = inter
 
-        grid_vals = {}
+        vals, stacks = {}, {}
         for grp in GROUPS:
             ds = [d for d in lst if d["group"] == grp]
             if not ds or len(inter) < 8:
-                grid_vals[grp] = None
+                vals[grp] = None
+                stacks[grp] = None
                 continue
             mats = []
             for d in ds:
                 idx = [d["ch"].index(ch) for ch in inter]
                 mats.append(d["delta"][idx])
-            grid_vals[grp] = np.nanmean(np.vstack(mats), axis=0)
-        data_rows[state] = grid_vals
+            X = np.vstack(mats)
+            vals[grp] = np.nanmean(X, axis=0)
+            stacks[grp] = X
+        row_data[state] = dict(vals=vals, stacks=stacks)
 
-    # shared vlim across both rows and all groups
     all_vals = []
     for state in STATES:
-        gv = data_rows.get(state)
-        if not gv:
+        rd = row_data.get(state)
+        if not rd:
             continue
         for grp in GROUPS:
-            if gv and gv.get(grp) is not None:
-                all_vals.append(np.abs(gv[grp]))
+            vec = rd["vals"].get(grp) if rd["vals"] else None
+            if vec is not None:
+                all_vals.append(np.abs(vec))
     if not all_vals:
         print(f"[{band}] Not enough data.")
         return
+
     vmax = float(np.nanpercentile(np.concatenate(all_vals), 95))
     if not np.isfinite(vmax) or vmax == 0:
         vmax = float(np.nanmax(np.concatenate(all_vals)))
     if not np.isfinite(vmax) or vmax == 0:
         vmax = 1e-6
+    vmax_cap = 30.0 if metric == "rel" else 2.0
+    vmax = min(vmax, vmax_cap)
     vlim = (-vmax, vmax)
 
     fig = plt.figure(figsize=FIGSIZE)
@@ -272,36 +287,45 @@ def plot_topomap_grid_for_band(band: str, results, metric: str, out_dir: Path):
 
     im = None
     for i, state in enumerate(STATES):
+        rd = row_data.get(state)
+        inter = ch_common.get(state, [])
         for j, grp in enumerate(GROUPS):
             ax = axes[i, j]
-            vec = None if (data_rows.get(state) is None) else data_rows[state].get(grp)
-            inter = ch_common.get(state, [])
-            if vec is None or len(inter) < 8:
+            if not rd or rd["vals"].get(grp) is None or len(inter) < 8:
                 ax.axis("off")
                 continue
+            vec = rd["vals"][grp]
+            X = rd["stacks"][grp]
+            tval, p = ttest_1samp(X, popmean=0.0, axis=0, nan_policy="omit")
+            rej, _ = fdr_correction(p, alpha=0.05)
+            mask = rej.astype(bool)
             info = make_info(inter, sfreq=250.0)
             im, _ = mne.viz.plot_topomap(
                 vec, info, cmap="RdBu_r", vlim=vlim,
                 contours=0, sensors=True, axes=ax, show=False,
+                mask=mask, mask_params=dict(marker="o", markersize=5, alpha=0.0),
             )
 
     fig.text(0.06, 0.72, STATES[0], va="center", ha="left", fontsize=13)
     fig.text(0.06, 0.26, STATES[1], va="center", ha="left", fontsize=13)
 
     cb = fig.colorbar(im, cax=cax)
-    cb.set_label("Increase (red)  /  Decrease (blue)")
+    if metric == "rel":
+        cb.set_label("Δ% (POST−PRE) — Increase (red) / Decrease (blue)")
+    else:
+        cb.set_label("Δ dB (POST−PRE) — Increase (red) / Decrease (blue)")
 
-    metric_title = "Relative Difference (POST − PRE)" if metric == "rel" else "Absolute Difference (POST − PRE)"
-    tag = "relDiff" if metric == "rel" else "absDiff"
-    fig.suptitle(f"Topomaps — {band}  |  {metric_title}", fontsize=17, y=TITLE_Y)
+    metric_title = "Relative Difference (POST−PRE, %)" if metric == "rel" else "Absolute Difference (POST−PRE, dB)"
+    fig.suptitle(f"Topomaps — {band}  |  {metric_title}  |  FDR q=.05", fontsize=17, y=TITLE_Y)
 
     plt.subplots_adjust(**MARGINS)
+    tag = "relDiff" if metric == "rel" else "absDiff"
     fname = out_dir / f"topogrid_{tag}_{band}.png"
     fig.savefig(fname, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved: {fname}")
 
-# --- run (REL & ABS) ----------------------------------------------------------
+# --- run (REL & ABS)
 results_rel = compute_post_minus_pre_deltas(metric="rel")
 results_abs = compute_post_minus_pre_deltas(metric="abs")
 
@@ -309,4 +333,4 @@ for band in BANDS_ORDER:
     plot_topomap_grid_for_band(band, results_rel, metric="rel", out_dir=OUT_REL)
     plot_topomap_grid_for_band(band, results_abs, metric="abs", out_dir=OUT_ABS)
 
-print("Topomaps generated (REL and ABS).")
+print("Topomaps generated (REL% and ABS dB, with FDR masking).")

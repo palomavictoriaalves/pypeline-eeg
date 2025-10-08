@@ -82,6 +82,18 @@ def detect_time_block_boundaries(tt):
         return []
     return list(tt[1:][dt > 1.3 * hop])
 
+def get_fixed_window(state, session):
+    """Return (x_lo, x_hi) from config.TS_FIXED_X_WINDOWS; supports keys 'EO'/'EC' or (state, session)."""
+    win_cfg = getattr(config, "TS_FIXED_X_WINDOWS", None)
+    if not win_cfg:
+        return None
+    key_ss = (str(state), str(session))
+    if key_ss in win_cfg:
+        lo, hi = win_cfg[key_ss]; return float(lo), float(hi)
+    if str(state) in win_cfg:
+        lo, hi = win_cfg[str(state)]; return float(lo), float(hi)
+    return None
+
 # --------------------------- panel --------------------------------------------
 def render_heatmap_panel(df, band, roi, args, scale_cache, value_col):
     sub = df[(df["band"] == band) & (df["region"] == roi) & (df["group"].isin(GROUPS))].copy()
@@ -128,7 +140,23 @@ def render_heatmap_panel(df, band, roi, args, scale_cache, value_col):
             if d_this.empty:
                 ax.set_axis_off()
                 continue
-            tt = np.sort(d_this["t_sec"].round(2).unique())
+            # Apply fixed window, if configured
+            x_window = get_fixed_window(state, session)
+            if x_window is not None:
+                x_lo, x_hi = x_window
+                d_this = d_this[(d_this["t_sec"] >= x_lo) & (d_this["t_sec"] <= x_hi)].copy()
+                if d_this.empty:
+                    ax.set_axis_off()
+                    continue
+                tt = np.sort(d_this["t_sec"].round(2).unique())
+                if tt.size < 2:
+                    step = getattr(config, "TS_STEP_SEC", 1.0)
+                    n = max(2, int(round((x_hi - x_lo) / max(step, 1e-9))) + 1)
+                    tt = np.linspace(x_lo, x_hi, n)
+                extent_x = (x_lo, x_hi)
+            else:
+                tt = np.sort(d_this["t_sec"].round(2).unique())
+                extent_x = (float(tt.min()), float(tt.max()))
 
             M = np.full((len(sids), len(tt)), np.nan, float)
             sid_index = {s: i for i, s in enumerate(sids)}
@@ -139,8 +167,10 @@ def render_heatmap_panel(df, band, roi, args, scale_cache, value_col):
             ax.imshow(
                 M, aspect="auto", origin="lower", interpolation="nearest",
                 cmap=args.cmap, norm=Normalize(vmin=vmin, vmax=vmax),
-                extent=[tt.min(), tt.max(), 0, len(sids)]
+                extent=[extent_x[0], extent_x[1], 0, len(sids)]
             )
+            if x_window is not None:
+                ax.set_xlim(extent_x)
             yticks = np.arange(len(sids)) + 0.5
             ax.set_yticks(yticks)
             ax.set_yticklabels(format_subject_ids(sids, args.id_format), fontsize=9)
@@ -155,7 +185,7 @@ def render_heatmap_panel(df, band, roi, args, scale_cache, value_col):
                     ax.axvline(xc, color="k", ls="--", lw=0.8, alpha=0.25)
 
             for sid in sids:
-                d_sid = d_group[(d_group["session"] == session) & (d_group["subject"].astype(str) == sid)]
+                d_sid = d_this[d_this["subject"].astype(str) == sid]
                 m = float(d_sid[value_col].mean()) if len(d_sid) else np.nan
                 auc = float(trapezoid(d_sid[value_col].values, x=d_sid["t_sec"].values)) if len(d_sid) else np.nan
                 summary_rows.append(dict(

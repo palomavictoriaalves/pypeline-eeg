@@ -161,6 +161,15 @@ Other key settings you will likely edit:
   TS_FDR_ALPHA      = 0.05
   TS_MARK_SIG       = True
   TS_GENERATE_PLOTS = True
+
+    # process only the first block (EO/EC) if True
+  TS_USE_FIRST_BLOCK_ONLY = True
+
+  # fixed X-windows per visual state (seconds, relative to block)
+  TS_FIXED_X_WINDOWS = {
+      "EO": (15.0, 55.0),
+      "EC": (150.0, 190.0),
+  }
   ```
 
 ---
@@ -229,8 +238,10 @@ python code/plot_mirror_EO_EC_points.py
 - `*_desc-preproc_clean_raw.fif` (concatenated)
 - `*_desc-preproc_EO_clean_raw.fif`
 - `*_desc-preproc_EC_clean_raw.fif`
+- `*_desc-preproc_EO_block1_raw.fif` (first EO block, post-ICA)
+- `*_desc-preproc_EC_block1_raw.fif` (first EC block, post-ICA)
 - `*_desc-preproc_blocks_manifest.csv`  
-**Key steps:** montage `standard_1020`, band-pass `[FILTER_LOW, FILTER_HIGH]`, notch `NOTCH_HZ`, average reference, EO/EC segmentation via `BLOCKS_WITH_STATE`, ICA (Infomax, `random_state=97`), auto IC rejection with **ICLabel**, `visual_state:*` annotations.
+**Key steps:** `standard_1020` montage, band-pass `[FILTER_LOW, FILTER_HIGH]`, notch `NOTCH_HZ`, average reference, EO/EC segmentation via `BLOCKS_WITH_STATE`, ICA (Infomax, `random_state=97`), automatic IC rejection with **ICLabel**, `visual_state:*` annotations.
 
 ---
 
@@ -242,15 +253,17 @@ python code/plot_mirror_EO_EC_points.py
 - `power_wide_abs_EO_EC.csv`
 - `power_wide_rel_EO_EC.csv`
 - `roi_coverage_EO_EC.csv`  
-**Notes:** REL = band / total ([`PSD_FMIN`, `PSD_FMAX`]); deterministic ordering controlled by `config` lists.
+**Notes:** REL = band / total over [`PSD_FMIN`, `PSD_FMAX`]; deterministic ordering controlled by `config` lists.
 
 ### `code/calc_timeseries_power.py`
 **Purpose:** Extract sliding-window power time series (ABS/REL) per **Band × ROI**.  
-**Inputs:** Preprocessed FIFs in `results/processed/**/eeg/`.  
+**Inputs:** Preprocessed FIFs in `results/processed/**/eeg/`. Respects:
+- `TS_USE_FIRST_BLOCK_ONLY=True` → uses `*_block1_raw.fif`
+- otherwise → uses `*_clean_raw.fif`  
 **Outputs:** `results/timeseries/`
 - `ts_power_long.csv`
 - `readme_params.json` (parameters used)  
-**Notes:** windows of `TS_WIN_SEC` with step `TS_STEP_SEC`; Welch per `WELCH_SEG_SEC`; EO/EC inferred from annotations or separate files.
+**Notes:** windows `TS_WIN_SEC` with step `TS_STEP_SEC`; Welch from `WELCH_SEG_SEC`; robust filename parser for subject/session/state.
 
 ### `code/calc_stats_power.py`
 **Purpose:** Minimal paired stats from wide power tables.  
@@ -258,23 +271,23 @@ python code/plot_mirror_EO_EC_points.py
 **Outputs:** `results/stats/{abs,rel}/`
 - `stats_*_EOvsEC.csv`
 - `stats_*_POSTvsPRE.csv`  
-**Key steps:** normality check (Shapiro–Wilk) → paired `ttest_rel` or `wilcoxon`; reports means, Δ, p-values, significance stars, and **Cohen’s d_z**.
+**Key steps:** Shapiro–Wilk on differences → paired `ttest_rel` or `wilcoxon`; reports means, Δ, p-values, significance stars, **Cohen’s d_z**, and `n`. Adds `delta_pct` with the correct baseline (EO for EC−EO; PRE for POST−PRE). Optional output precision via `PRECISION_MODE` (`none|fixed|auto`).
 
 ---
 
 ### `code/plot_timeseries_all_EC_EO.py`
-**Purpose:** Create 2×3 panels (PRE/POST × groups) with EO/EC ± 95% CI over time.  
-**Inputs:** `results/processed/**/eeg/*_clean_raw.fif`.  
+**Purpose:** 2×3 panels (**rows: EO/EC; columns: groups**) plotting **PRE** and **POST** mean ± 95% CI over time.  
+**Inputs:** `results/processed/**/eeg/*.fif` (uses `*_block1_raw.fif` if `TS_USE_FIRST_BLOCK_ONLY=True`, else `*_clean_raw.fif`).  
 **Outputs:** `results/plots/timeseries_all/`
 - `csv/timeseries_all_bands_rois_relabs.csv`
 - `figs/timeseries_<Band>_<metric>_<ROI>.png`  
-**Notes:** PSD sliding windows; aggregation by `ROI_CHANNELS`; EO/EC alignment per subject; optional BH-FDR marking (`TS_FDR_ALPHA`).
+**Notes:** fixed X-windows per visual state via `TS_FIXED_X_WINDOWS`; PSD sliding windows; aggregation by `ROI_CHANNELS`; optional BH-FDR timepoint marking (`TS_FDR_ALPHA`).
 
 ### `code/plot_topomaps_grid_EO_EC.py`
-**Purpose:** 2×3 topographic grids (EO/EC × groups) showing **POST − PRE** per band.  
+**Purpose:** 2×3 topographic grids (EO/EC × groups) of **POST − PRE** per band.  
 **Inputs:** Preprocessed FIFs.  
 **Outputs:** `results/plots/topomaps_grid_{rel,abs}/topogrid_{relDiff|absDiff}_<Band>.png`  
-**Notes:** mean per channel inside each band; REL normalized by total; color limits shared per band/state.
+**Notes:** per-channel one-sample t vs. 0 with **FDR q=.05**; REL shown as **Δ%**, ABS as **Δ dB**; shared color limits per figure.
 
 ### `code/plot_heat_all_bands_timeseries.py`
 **Purpose:** Time × participant heatmaps (rows: EO/EC × PRE/POST; columns: groups).  
@@ -282,7 +295,7 @@ python code/plot_mirror_EO_EC_points.py
 **Outputs:** `results/plots/timeseries_heatmaps_prepost/`
 - `heat_PREPOST_<Band>_<ROI>_{REL|ABS}_<order>.png`
 - `summary_<Band>_<ROI>_{REL|ABS}.csv` (mean & AUC per subject; outlier flag)  
-**Notes:** color scale options (panel/band/global); subject ordering configurable; AUC computed via `scipy.integrate.trapezoid`.
+**Notes:** color scale options (panel/band/global); subject ordering configurable; AUC via `scipy.integrate.trapezoid`.
 
 ### `code/plot_mirror_EO_EC_points.py`
 **Purpose:** Mirror/bar/point plots for **Band × ROI**.  
@@ -290,7 +303,8 @@ python code/plot_mirror_EO_EC_points.py
 **Outputs:**  
 - `results/plots/mirror_by_region_rel/mirror_<Band>_<ROI>.png`
 - `results/plots/mirror_by_region_abs/mirror_<Band>_<ROI>.png`  
-**Notes:** PRE left / POST right; error bars = 95% CI (or SE if SciPy unavailable); outliers flagged when |z| ≥ 2.
+**Notes:** PRE on left / POST on right; error bars = 95% CI (fallback: SE); outliers flagged when |z| ≥ 2; scientific notation on X-axis; per-panel X-limits (band+region).
+
 
 ---
 

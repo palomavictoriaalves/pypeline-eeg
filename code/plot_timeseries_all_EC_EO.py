@@ -1,6 +1,6 @@
 """
 Time series (EO/EC) per band × ROI, split by PRE/POST and group.
-Saves a long CSV and 2×3 panels (PRE/POST × groups) with EO and EC means ± 95% CI.
+Saves a long CSV and 2×3 panels (PRE/POST × groups) with means ± 95% CI and optional FDR marks.
 """
 from pathlib import Path
 import re
@@ -13,7 +13,6 @@ from scipy.stats import t, wilcoxon
 
 import config
 
-# ---- I/O and parameters from config ------------------------------------------
 PROCESSED_DIR = config.PROCESSED_DIR
 PLOTS_DIR     = config.PLOTS_DIR
 OUT_DIR       = PLOTS_DIR / "timeseries_all"
@@ -35,52 +34,43 @@ ROI_CHANNELS  = config.ROI_CHANNELS
 TS_WIN_SEC    = config.TS_WIN_SEC
 TS_STEP_SEC   = config.TS_STEP_SEC
 
-ALPHA_FDR     = config.TS_FDR_ALPHA
-MARK_SIG      = config.TS_MARK_SIG
+ALPHA_FDR      = config.TS_FDR_ALPHA
+MARK_SIG       = config.TS_MARK_SIG
 GENERATE_PLOTS = config.TS_GENERATE_PLOTS
 
-GROUP_ACTIVE  = set(config.GROUP_ACTIVE)
-GROUP_PASSIVE = set(config.GROUP_PASSIVE)
-GROUP_CONTROL = set(config.GROUP_CONTROL)
+GROUP_ACTIVE   = set(config.GROUP_ACTIVE)
+GROUP_PASSIVE  = set(config.GROUP_PASSIVE)
+GROUP_CONTROL  = set(config.GROUP_CONTROL)
 
-# ---- Helpers -----------------------------------------------------------------
+
 def parse_subject_session_state(stem: str):
-    """Extract subject (NN), session (PRE/POST), and visual state (EO/EC) from filenames."""
     s = stem.upper()
-
-    m = re.search(r"SUB[-_]?(\d{2,})", s)
-    if not m:
-        m = re.search(r"(\d{2,})", s)
+    m = re.search(r"SUB[-_]?(\d{2,})", s) or re.search(r"(\d{2,})", s)
     sub = (m.group(1) if m else stem).zfill(2)
-
     if re.search(r"(SES[-_]?PRE|[-_]PRE)(?:[-_]|$)", s):
         sess = "PRE"
     elif re.search(r"(SES[-_]?POST|[-_](POST|POS))(?:[-_]|$)", s):
         sess = "POST"
     else:
         sess = ""
-
     if re.search(r"(^|[-_])EC($|[-_])", s):
         state = "EC"
     elif re.search(r"(^|[-_])EO($|[-_])", s):
         state = "EO"
     else:
         state = ""
-
     return sub, sess, state
 
 
 def map_subject_to_group(sub: str) -> str:
-    """Return group label for NN subject code using config groups."""
     sid = str(sub).zfill(2)
-    if sid in GROUP_ACTIVE:  return GROUPS_ORDER[0]  # "Active"
-    if sid in GROUP_PASSIVE: return GROUPS_ORDER[1]  # "Passive"
-    if sid in GROUP_CONTROL: return GROUPS_ORDER[2]  # "Control"
+    if sid in GROUP_ACTIVE:  return GROUPS_ORDER[0]
+    if sid in GROUP_PASSIVE: return GROUPS_ORDER[1]
+    if sid in GROUP_CONTROL: return GROUPS_ORDER[2]
     return "Unknown"
 
 
 def rois_from_channels(ch_names):
-    """Use ROIs from config; require ≥2 channels per ROI; always include 'All'."""
     rois = {}
     for name, arr in ROI_CHANNELS.items():
         got = [c for c in arr if c in ch_names]
@@ -91,7 +81,6 @@ def rois_from_channels(ch_names):
 
 
 def mean_and_ci95(x):
-    """Return (mean, lower, upper) 95% CI; NaNs ignored."""
     x = np.asarray(x, float)
     x = x[np.isfinite(x)]
     if x.size == 0:
@@ -99,13 +88,13 @@ def mean_and_ci95(x):
     m = float(np.mean(x))
     if x.size == 1:
         return m, np.nan, np.nan
-    sd = float(np.std(x, ddof=1)); se = sd / np.sqrt(x.size)
+    sd = float(np.std(x, ddof=1))
+    se = sd / np.sqrt(x.size)
     tcrit = t.ppf(0.975, x.size - 1)
     return m, float(m - tcrit * se), float(m + tcrit * se)
 
 
 def fdr_bh_mask(pvals, alpha=0.05):
-    """Benjamini–Hochberg FDR: return boolean mask of discoveries."""
     p = np.asarray(pvals, float)
     n = p.size
     if n == 0:
@@ -121,9 +110,7 @@ def fdr_bh_mask(pvals, alpha=0.05):
     return p <= crit
 
 
-# ---- PSD by sliding epochs ----------------------------------------------------
 def compute_series_for_raw(raw, band_tuple):
-    """Return (times_s, abs_by_ch, rel_by_ch, ch_names) via sliding windows."""
     fmin_band, fmax_band = band_tuple
     raw = raw.copy().pick("eeg")
     sf = float(raw.info["sfreq"])
@@ -143,10 +130,10 @@ def compute_series_for_raw(raw, band_tuple):
         n_fft=nseg, n_per_seg=nseg, n_overlap=int(round(WELCH_OVERLAP * nseg)),
         verbose="ERROR"
     )
-    psds, freqs = spec.get_data(return_freqs=True)  # (n_ep, n_ch, n_freqs)
+    psds, freqs = spec.get_data(return_freqs=True)
 
     band_mask  = (freqs >= fmin_band) & (freqs <= fmax_band)
-    total_mask = (freqs >= PSD_FMIN) & (freqs <= fmax_eff)
+    total_mask = (freqs >= PSD_FMIN)  & (freqs <= fmax_eff)
 
     abs_band = psds[:, :, band_mask].mean(axis=2)
     total    = psds[:, :, total_mask].mean(axis=2)
@@ -155,14 +142,13 @@ def compute_series_for_raw(raw, band_tuple):
     return times, abs_band, rel_band, epochs.ch_names
 
 
-# ---- Series extraction --------------------------------------------------------
 def collect_all_series():
-    """Build a long DataFrame with all series across bands/metrics/ROIs."""
-    fifs = sorted(PROCESSED_DIR.rglob("*_clean_raw.fif"))
-    print(f"Files found: {len(fifs)}")
+    use_first_block = getattr(config, "TS_USE_FIRST_BLOCK_ONLY", False)
+    fifs = sorted(PROCESSED_DIR.rglob("*_block1_raw.fif" if use_first_block else "*_clean_raw.fif"))
+    print(f"Files found{ ' (first block only)' if use_first_block else '' }: {len(fifs)}")
 
     rows = []
-    bank = {}  # (sub, state, sess) -> path
+    bank = {}
     for f in fifs:
         sub, sess, state = parse_subject_session_state(f.stem)
         if state in VS_ORDER and sess in {"PRE", "POST"}:
@@ -177,7 +163,6 @@ def collect_all_series():
             raw.set_montage("standard_1020", on_missing="ignore")
         except Exception:
             pass
-
         for band_name, band_tuple in BANDS.items():
             times, abs_by_ch, rel_by_ch, chs = compute_series_for_raw(raw, band_tuple)
             if times.size == 0 or abs_by_ch.size == 0 or rel_by_ch.size == 0:
@@ -202,40 +187,37 @@ def collect_all_series():
     return pd.DataFrame.from_records(rows)
 
 
-# ---- Alignment and plotting ---------------------------------------------------
-def align_pairs_per_subject(df_panel):
-    """For a panel, return common time grid and EO/EC matrices aligned per subject."""
+def align_sessions_per_subject(df_panel):
     subs = sorted(df_panel.subject.astype(str).unique(), key=lambda s: int(s))
     ts_common = None
-    EO_list, EC_list = [], []
+    PRE_list, POST_list = [], []
     for sub in subs:
         dsub = df_panel[df_panel.subject.astype(str) == sub]
-        d_eo = dsub[dsub.visual_state == "EO"].sort_values("time_s")
-        d_ec = dsub[dsub.visual_state == "EC"].sort_values("time_s")
-        n = int(min(len(d_eo), len(d_ec)))
+        d_pre  = dsub[dsub.session == "PRE"].sort_values("time_s")
+        d_post = dsub[dsub.session == "POST"].sort_values("time_s")
+        n = int(min(len(d_pre), len(d_post)))
         if n == 0:
             continue
-        tt = 0.5 * (d_eo.time_s.values[:n] + d_ec.time_s.values[:n])
-        eo = d_eo.value.values[:n]
-        ec = d_ec.value.values[:n]
+        tt = 0.5 * (d_pre.time_s.values[:n] + d_post.time_s.values[:n])
+        pre  = d_pre.value.values[:n]
+        post = d_post.value.values[:n]
         if ts_common is None:
             ts_common = tt
-            EO_list = [eo]
-            EC_list = [ec]
+            PRE_list  = [pre]
+            POST_list = [post]
         else:
             m = min(len(ts_common), len(tt))
             ts_common = ts_common[:m]
-            EO_list = [x[:m] for x in EO_list]
-            EC_list = [y[:m] for y in EC_list]
-            EO_list.append(eo[:m])
-            EC_list.append(ec[:m])
+            PRE_list  = [x[:m] for x in PRE_list]
+            POST_list = [y[:m] for y in POST_list]
+            PRE_list.append(pre[:m])
+            POST_list.append(post[:m])
     if ts_common is None:
         return None, None, None
-    return ts_common, np.vstack(EO_list), np.vstack(EC_list)
+    return ts_common, np.vstack(PRE_list), np.vstack(POST_list)
 
 
 def plot_timeseries_grid(df_all, band, metric, roi):
-    """2×3 panel (PRE/POST × groups) with EO/EC means ± 95% CI; optional BH-FDR marks."""
     fig = plt.figure(figsize=(13.2, 8.0), facecolor="white")
     gs = gridspec.GridSpec(nrows=2, ncols=3, figure=fig, wspace=0.24, hspace=0.34)
     axes = np.empty((2, 3), dtype=object)
@@ -252,52 +234,60 @@ def plot_timeseries_grid(df_all, band, metric, roi):
 
     bbox0 = axes[0, 0].get_position()
     bbox1 = axes[1, 0].get_position()
-    y_pre_center  = (bbox0.y0 + bbox0.y1) / 2
-    y_post_center = (bbox1.y0 + bbox1.y1) / 2
-    fig.text(0.065, y_pre_center,  "PRE",  va="center", ha="right", fontsize=14)
-    fig.text(0.065, y_post_center, "POST", va="center", ha="right", fontsize=14)
+    fig.text(0.065, (bbox0.y0 + bbox0.y1) / 2, "EO",  va="center", ha="right", fontsize=14)
+    fig.text(0.065, (bbox1.y0 + bbox1.y1) / 2, "EC",  va="center", ha="right", fontsize=14)
 
-    sessions = ["PRE", "POST"]
+    states = ["EO", "EC"]
     legend_handles, legend_labels = None, None
-
     row_ymins = [np.inf, np.inf]
     row_ymaxs = [-np.inf, -np.inf]
 
-    for i, sess in enumerate(sessions):
+    time_limits = getattr(config, "TS_FIXED_X_WINDOWS", {"EO": (0, 40), "EC": (0, 40)})
+
+    for i, state in enumerate(states):
         for j, grp in enumerate(GROUPS_ORDER):
             ax = axes[i, j]
             d = df_all[
-                (df_all.session == sess) & (df_all.group == grp) &
+                (df_all.visual_state == state) & (df_all.group == grp) &
                 (df_all.band == band) & (df_all.metric == metric) & (df_all.roi == roi)
             ]
             if d.empty:
                 ax.axis("off"); continue
 
-            ts, EO, EC = align_pairs_per_subject(d)
+            ts, PRE, POST = align_sessions_per_subject(d)
             if ts is None:
                 ax.axis("off"); continue
 
-            mean_eo = np.nanmean(EO, axis=0)
-            mean_ec = np.nanmean(EC, axis=0)
-            ci_eo = np.array([mean_and_ci95(EO[:, k]) for k in range(EO.shape[1])])
-            ci_ec = np.array([mean_and_ci95(EC[:, k]) for k in range(EC.shape[1])])
+            t_min, t_max = time_limits[state]
+            mask = (ts >= t_min) & (ts <= t_max)
+            ts_f    = ts[mask]
+            PRE_f   = PRE[:, mask]
+            POST_f  = POST[:, mask]
+            if ts_f.size == 0:
+                ax.axis("off"); continue
 
-            h1, = ax.plot(ts, mean_eo, label="EO", linewidth=2.0)
-            ax.fill_between(ts, ci_eo[:, 1], ci_eo[:, 2], alpha=0.18)
-            h2, = ax.plot(ts, mean_ec, label="EC", linewidth=2.0)
-            ax.fill_between(ts, ci_ec[:, 1], ci_ec[:, 2], alpha=0.18)
+            mean_pre  = np.nanmean(PRE_f, axis=0)
+            mean_post = np.nanmean(POST_f, axis=0)
+            ci_pre  = np.array([mean_and_ci95(PRE_f[:, k])  for k in range(PRE_f.shape[1])])
+            ci_post = np.array([mean_and_ci95(POST_f[:, k]) for k in range(POST_f.shape[1])])
+
+            h1, = ax.plot(ts_f, mean_pre,  label="PRE",  linewidth=2.0)
+            ax.fill_between(ts_f, ci_pre[:, 1],  ci_pre[:, 2],  alpha=0.18)
+            h2, = ax.plot(ts_f, mean_post, label="POST", linewidth=2.0)
+            ax.fill_between(ts_f, ci_post[:, 1], ci_post[:, 2], alpha=0.18)
 
             if legend_handles is None:
-                legend_handles = [h1, h2]; legend_labels = ["EO", "EC"]
+                legend_handles = [h1, h2]; legend_labels = ["PRE", "POST"]
 
             ax.set_xlabel("Time (s)", fontsize=11)
             if j == 0:
                 ax.set_ylabel("Relative Power" if metric == "rel" else "Absolute Power", fontsize=11)
+            ax.set_xlim(t_min, t_max)
 
             if MARK_SIG:
                 pvals = []
-                for k in range(EO.shape[1]):
-                    a = EC[:, k]; b = EO[:, k]
+                for k in range(PRE_f.shape[1]):
+                    a = POST_f[:, k]; b = PRE_f[:, k]
                     m = np.isfinite(a) & np.isfinite(b)
                     if np.sum(m) < 3:
                         pvals.append(1.0); continue
@@ -308,21 +298,20 @@ def plot_timeseries_grid(df_all, band, metric, roi):
                     pvals.append(float(p))
                 sigmask = fdr_bh_mask(np.array(pvals), alpha=ALPHA_FDR)
 
-                y_top = np.nanmax([ci_eo[:, 2], ci_ec[:, 2]])
-                dy = (np.nanmax([mean_eo, mean_ec]) - np.nanmin([mean_eo, mean_ec]))
+                y_top = np.nanmax([ci_pre[:, 2], ci_post[:, 2]])
+                dy = (np.nanmax([mean_pre, mean_post]) - np.nanmin([mean_pre, mean_post]))
                 y_mark = y_top + (0.06 if np.isfinite(dy) else 0.06) * (dy if np.isfinite(dy) and dy > 0 else 1.0)
-                ax.plot(ts, np.where(sigmask, y_mark, np.nan), linewidth=3.0, color="green", solid_capstyle="butt")
+                ax.plot(ts_f, np.where(sigmask, y_mark, np.nan), linewidth=3.0, color="green", solid_capstyle="butt")
 
-                y_min = np.nanmin([ci_eo[:, 1], ci_ec[:, 1]])
-                y_max = max(y_mark, np.nanmax([ci_eo[:, 2], ci_ec[:, 2]]))
+                y_min = np.nanmin([ci_pre[:, 1], ci_post[:, 1]])
+                y_max = max(y_mark, np.nanmax([ci_pre[:, 2], ci_post[:, 2]]))
             else:
-                y_min = np.nanmin([ci_eo[:, 1], ci_ec[:, 1]])
-                y_max = np.nanmax([ci_eo[:, 2], ci_ec[:, 2]])
+                y_min = np.nanmin([ci_pre[:, 1], ci_post[:, 1]])
+                y_max = np.nanmax([ci_pre[:, 2], ci_post[:, 2]])
 
             row_ymins[i] = min(row_ymins[i], y_min)
             row_ymaxs[i] = max(row_ymaxs[i], y_max)
 
-    # unify y-limits per row
     for i in range(2):
         ymin, ymax = row_ymins[i], row_ymaxs[i]
         pad = 0.04 * (ymax - ymin if np.isfinite(ymax - ymin) and (ymax - ymin) > 0 else 1.0)
@@ -345,10 +334,11 @@ def plot_timeseries_grid(df_all, band, metric, roi):
     print(f"Saved: {fname}")
 
 
-# ---- Main --------------------------------------------------------------------
 def main():
     print("Scanning derivatives…", PROCESSED_DIR.resolve())
-    print("Files matching *_clean_raw.fif:", len(list(PROCESSED_DIR.rglob("*_clean_raw.fif"))))
+    use_first_block = getattr(config, "TS_USE_FIRST_BLOCK_ONLY", False)
+    pat = "*_block1_raw.fif" if use_first_block else "*_clean_raw.fif"
+    print(f"Files matching {pat}:", len(list(PROCESSED_DIR.rglob(pat))))
 
     print("Extracting time series for all bands/ROIs (relative and absolute)…")
     df = collect_all_series()
